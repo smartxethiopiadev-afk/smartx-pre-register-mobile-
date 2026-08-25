@@ -36,7 +36,7 @@ export default {
     if (request.method === 'POST') {
       try {
         const update = await request.json();
-        await handleTelegramUpdate(update, env);
+        await handleTelegramUpdate(update, env, ctx);
       } catch (err) {
         console.error('Unhandled Telegram Processing Error:', err);
         // Dispatch alert to Admin private chat on failure
@@ -68,7 +68,7 @@ export default {
 /**
  * Main Handler for Telegram Updates (business_message or standard message)
  */
-async function handleTelegramUpdate(update, env) {
+async function handleTelegramUpdate(update, env, ctx) {
   const message = update.business_message || update.message;
   if (!message) return;
 
@@ -82,32 +82,59 @@ async function handleTelegramUpdate(update, env) {
   const senderName = message.from?.first_name || message.chat?.first_name || '';
   const senderUsername = message.from?.username || message.chat?.username || '';
 
+  // 🌟 1. Handle New Chat Member Joining Group (Welcome Message & Auto-Delete)
+  if (isGroup && message.new_chat_members && message.new_chat_members.length > 0) {
+    // Delete service message "X joined the group" to keep chat pristine
+    await deleteTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, message.message_id);
+
+    for (const newMember of message.new_chat_members) {
+      if (newMember.is_bot) continue;
+      const memberName = newMember.first_name || newMember.username || 'ውድ አባል';
+      const welcomeText =
+        `👋 ሰላም <b>${memberName}</b>! እንኳን ወደ <b>Smart x Ethiopian</b> ግሩፕ በደህና መጡ! ✨\n\n` +
+        `📚 Short Note & Worksheet ለማግኘት እና ለ Mobile App ምዝገባ 👉 <a href="https://t.me/SmartX_PreRegister_bot?start=ref_7471102761">@SmartX_PreRegister_bot</a> ይጫኑ!`;
+
+      const sentWelcome = await sendSimpleTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, welcomeText);
+      if (sentWelcome && sentWelcome.message_id) {
+        // Auto-delete welcome message after 10 seconds to keep group clean
+        const delayedDelete = new Promise((resolve) => setTimeout(resolve, 10000)).then(async () => {
+          await deleteTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, sentWelcome.message_id);
+        });
+        if (ctx && ctx.waitUntil) {
+          ctx.waitUntil(delayedDelete);
+        }
+      }
+    }
+    return;
+  }
+
+  // 🧹 2. Handle Member Leaving Group (Delete Service Message)
+  if (isGroup && message.left_chat_member) {
+    await deleteTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, message.message_id);
+    return;
+  }
+
   let userCaption = message.text || message.caption || '';
 
-  // 🛡️ Group Anti-Link & Protection System
+  // 🛑 Conversation Closing Acknowledgement Rule:
+  // If the previous message was already an assistant reply/closing and the user just says "tnx", "eshi", "thanks", "አመሰግናለሁ", etc.
+  // without asking any new question, do NOT spam them with another message.
+  let history = CHAT_HISTORIES.get(chatId) || [];
+  if (!isGroup && isClosingAcknowledgement(userCaption, history)) {
+    console.log(`User acknowledged with closing phrase "${userCaption}". Keeping conversation concluded peacefully.`);
+    return;
+  }
+
+  // 🛡️ 3. Group Anti-Link & Protection System (Silent Deletion)
   if (isGroup) {
     const hasLink = checkMessageContainsLink(message, userCaption);
     if (hasLink) {
       const isAdminUser = await checkIfAdmin(env.TELEGRAM_BOT_TOKEN, chatId, senderId, senderUsername);
       if (!isAdminUser) {
-        console.log(`🛡️ Anti-Link triggered in group ${chatId} by user ${senderId} (${senderUsername || senderName}). Deleting message...`);
-        // 1. Delete unauthorized link message immediately
+        console.log(`🛡️ Anti-Link triggered in group ${chatId} by user ${senderId} (${senderUsername || senderName}). Silently deleting link...`);
+        // Silently delete unauthorized link message immediately without sending any warning text
         await deleteTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, message.message_id);
-
-        // 2. Send short warning to group
-        const warningMsg = `⚠️ <b>${senderName || 'አባል'}</b>፣ በግሩፑ ውስጥ የሊንክ (Link) ልጥፍ የተከለከለ ስለሆነ መልእክትዎ ተሰርዟል!`;
-        const sentWarning = await sendSimpleTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, warningMsg);
-
-        // 3. Auto-delete warning after 8 seconds to keep group clean
-        if (sentWarning && sentWarning.message_id) {
-          setTimeout(async () => {
-            try {
-              await deleteTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, sentWarning.message_id);
-            } catch (_) {}
-          }, 8000);
-        }
-
-        return; // Stop processing link message
+        return; // Stop processing link message silently
       }
     }
   }
@@ -284,19 +311,20 @@ async function callGeminiWithFallback(contents, apiKey, userName = '', isGroup =
     `6. ABSOLUTE CONCISE RESPONSES: Keep every response short, clean, direct, and decorated with tasteful emojis 😊. Maximum 2-4 lines or clean bullet steps. No giant essays.\n` +
     `7. CHAT HISTORY CONTINUITY: Always read and respect the previous chat history naturally.\n\n` +
     groupInstruction +
-    `📚 INBOX SCENARIO & REGISTRATION STEPS (Short Notes, Worksheets, Group & App Release):\n` +
+    `📚 INBOX SCENARIO & REGISTRATION STEPS (Short Notes, Worksheets & App Release):\n` +
     `- CONTEXT: Habtamu posts on groups: "short note and worksheet የምትፈልጉ በ inbox አውሩን".\n` +
     `- When users message in inbox (e.g., "እኔ እፈልጋለው", "hi", "worksheet", "short note", "መዝግቡኝ", "እንዴት ላግኝ", "ጥያቄ አለኝ", or any related request):\n` +
     `  1. Greet them warmly with their name (e.g. "ሰላም ${userName || ''}! 👋 እንኳን ደህና መጡ!")\n` +
-    `  2. Tell them to register on the bot by clicking "🚀 ምዝገባ ጀምር (Start Bot)" and join the official group: https://t.me/SmartX_Ethio\n` +
-    `  3. Give them the simple step-by-step guidance:\n` +
-    `     • ደረጃ 1: ከታች ያለውን "🚀 ምዝገባ ጀምር" Button ይጫኑ\n` +
-    `     • ደረጃ 2: Language (ቋንቋ) ይምረጡ (አማርኛ ወይም English)\n` +
-    `     • ደረጃ 3: የክፍል ደረጃዎን ይምረጡ (Grade 9 - 12)\n` +
-    `     • ደረጃ 4: የፍላጎት ማረጋገጫ 5 አጫጭር ጥያቄዎችን ይመልሱ\n` +
-    `     • ደረጃ 5: Telegram Channel Join ያድርጉ እና የውይይት ግሩፑን (https://t.me/SmartX_Ethio) ይቀላቀሉ\n` +
+    `  2. Tell them clearly: Short note እና Worksheet ለማግኘት እንዲሁም ለአዲሱ Mobile App ለመመዝገብ ከታች ያለውን "🚀 ምዝገባ ጀምር (Start Bot)" button ይጫኑ ወይም @SmartX_PreRegister_bot ላይ ይግቡ።\n` +
+    `  3. Give them the clear, clean step-by-step guidance:\n` +
+    `     1️⃣ @SmartX_PreRegister_bot ገብተው "Start" ይበሉ\n` +
+    `     2️⃣ ቋንቋ እና የክፍል ደረጃዎን (Grade 9 - 12) ይምረጡ\n` +
+    `     3️⃣ የፍላጎት ማረጋገጫ 5 አጫጭር ጥያቄዎችን ይመልሱ\n` +
+    `     4️⃣ የቴሌግራም ቻናላችንን Join ያድርጉ\n` +
     `  4. Explain about Mobile App APK Release: አዲሱ Smart x Ethiopian Mobile Application (.apk file) በይፋ መስከረም 5 ይለቀቃል! Notification On አድርገው ይጠብቁ።\n` +
-    `  5. SCREENSHOT RULE: Do NOT ask for screenshots by default. Only tell them: "የከበዳችሁ ወይም ያልገባችሁ ደረጃ ካለ የ Screen Shot ምስል ላኩልን፣ በደስታ እናግዛችኋለን! 😊"\n\n` +
+    `  5. SCREENSHOT RULE: Do NOT ask for screenshots by default. Only tell them: "የከበዳችሁ ወይም ያልገባችሁ ደረጃ ካለ የ Screen Shot ምስል ላኩልን፣ በደስታ እናግዛችኋለን! 😊"\n` +
+    `  6. IMPORTANT FORMATTING RULE: In your message text, NEVER write raw URLs like "https://t.me/...". ALWAYS write the clean username "@SmartX_PreRegister_bot" instead, so the message stays neat and human-like.\n` +
+    `  7. GROUP LINK RULE: Do NOT give the telegram group link unless the user explicitly asks for "group", "ግሩፕ", or "group link". If asked, provide: @SmartX_Ethio.\n\n` +
     `📞 PHONE NUMBER & CONTACTS RULE:\n` +
     `- If a user asks for phone number, direct call, or direct contact, provide: 0992480372 (ወይም በ @smart_x_help ያግኙን).\n\n` +
     `🎙️ VISION, TROUBLESHOOTING & MULTIMODAL:\n` +
@@ -307,13 +335,13 @@ async function callGeminiWithFallback(contents, apiKey, userName = '', isGroup =
     `- If a user asks about forwarding, leaking, or screenshotting chat content outside, politely remind them in Amharic:\n` +
     `  "⚠️ *ለደህንነት ሲባል የዚህ chat መረጃዎች Forward ማድረግ ወይም Screenshot ማንሳት የተከለከሉ ናቸው። ለተጨማሪ መረጃ በ 0992480372 ያግኙን!*"\n\n` +
     `🧠 TONE & PERSONALITY (HUMAN-LIKE):\n` +
-    `- Speak warmly, politely, and casually like a real professional human assistant in Amharic.\n` +
+    `- Speak warmly, politely, calmly, and naturally like a real professional human assistant in Amharic.\n` +
+    `- Avoid robotic walls of text or repetitive boilerplate. Be direct, clear, and helpful.\n` +
     `- Always end with a polite, natural follow-up question or helpful closing.\n\n` +
     `📞 OFFICIAL CONTACT DETAILS:\n` +
     `Only share when requested or relevant:\n` +
     `- Telegram Username: @smart_x_help\n` +
-    `- Pre-Registration Bot Link: https://t.me/SmartX_PreRegister_bot?start=ref_7471102761\n` +
-    `- Telegram Group Link: https://t.me/SmartX_Ethio\n` +
+    `- Pre-Registration Bot: @SmartX_PreRegister_bot\n` +
     `- Phone Number: 0992480372\n` +
     `- YouTube Channel: https://www.youtube.com/@smartx.ethiopia\n` +
     `- App Release Date: መስከረም 5 (Smart x Ethiopian Mobile App .apk file)\n\n` +
@@ -454,12 +482,6 @@ function getRegistrationInlineMarkup(text) {
             text: '🚀 ምዝገባ ጀምር (Start Bot) 👉',
             url: 'https://t.me/SmartX_PreRegister_bot?start=ref_7471102761'
           }
-        ],
-        [
-          {
-            text: '👥 የቴሌግራም ግሩፕ ተቀላቀሉ (Join Group) 💬',
-            url: 'https://t.me/SmartX_Ethio'
-          }
         ]
       ]
     };
@@ -479,7 +501,9 @@ async function sendTelegramMessage(token, chatId, text, businessConnectionId = n
   const body = {
     chat_id: chatId,
     text: htmlText,
-    parse_mode: 'HTML'
+    parse_mode: 'HTML',
+    link_preview_options: { is_disabled: true },
+    disable_web_page_preview: true
   };
 
   if (inlineMarkup) {
@@ -490,7 +514,7 @@ async function sendTelegramMessage(token, chatId, text, businessConnectionId = n
     body.business_connection_id = businessConnectionId;
   }
 
-  // Primary Attempt: Send with HTML formatting and inline button
+  // Primary Attempt: Send with HTML formatting, inline button, and link previews disabled
   let res = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -821,4 +845,66 @@ async function handleSetWebhook(originUrl, env) {
     status: res.status,
     headers: { 'Content-Type': 'application/json' }
   });
+}
+
+/**
+ * Check if the user message is a polite closing or acknowledgement (e.g. TNX, እሺ, Thanks, Ok, Bye)
+ * when previous interaction was already completed by assistant.
+ */
+function isClosingAcknowledgement(text, history) {
+  if (!text || typeof text !== 'string') return false;
+
+  // Clean and normalize text
+  const clean = text
+    .trim()
+    .toLowerCase()
+    .replace(/[.,!?:;🙏👍👋😊🙌❤️✨]/g, '')
+    .trim();
+
+  // If text is too long or contains a question mark, it's a real question or conversation
+  if (text.length > 25 || text.includes('?') || text.includes('？') || text.includes('እንዴት') || text.includes('ምን')) {
+    return false;
+  }
+
+  const closingWords = new Set([
+    'tnx',
+    'thx',
+    'thanks',
+    'thank you',
+    'thank u',
+    'tq',
+    'ty',
+    'eshi',
+    'ishi',
+    'ok',
+    'okay',
+    'k',
+    'kk',
+    'bye',
+    'bye bye',
+    'goodbye',
+    'cya',
+    'እሺ',
+    'እሽ',
+    'አመሰግናለሁ',
+    'እናመሰግናለን',
+    'አመሰግናለው',
+    'እናመሰግናለን',
+    'ተመስገን',
+    'ደህና ሁን',
+    'ደህና ሁኑ',
+    'ሰላም ሁን',
+    'ሰላም ሁኑ',
+    'መልካም ቀን',
+    'መልካም ምሽት'
+  ]);
+
+  if (closingWords.has(clean)) {
+    // If we have history and the assistant already replied in previous turns, conclude gracefully
+    if (history && history.length >= 2) {
+      return true;
+    }
+  }
+
+  return false;
 }
