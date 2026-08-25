@@ -93,7 +93,7 @@ async function handleTelegramUpdate(update, env, ctx) {
         const memberName = user.first_name || user.username || 'ውድ አባል';
         const welcomeText =
           `👋 ሰላም <b>${memberName}</b>! እንኳን ወደ <b>Smart x Ethiopian</b> ግሩፕ በደህና መጡ! ✨\n\n` +
-          `📚 Short Note & Worksheet ለማግኘት እና ለ Mobile App ምዝገባ 👉 <a href="https://t.me/SmartX_PreRegister_bot?start=ref_7471102761">@SmartX_PreRegister_bot</a> ይጫኑ!`;
+          `📚 Short Note & Worksheet ለማግኘት እና ለ Mobile App ምዝገባ 👉 @SmartX_PreRegister_bot ይጫኑ!`;
 
         const sentWelcome = await sendSimpleTelegramMessage(env.TELEGRAM_BOT_TOKEN, chat.id, welcomeText);
         if (sentWelcome && sentWelcome.message_id) {
@@ -132,7 +132,7 @@ async function handleTelegramUpdate(update, env, ctx) {
       const memberName = newMember.first_name || newMember.username || 'ውድ አባል';
       const welcomeText =
         `👋 ሰላም <b>${memberName}</b>! እንኳን ወደ <b>Smart x Ethiopian</b> ግሩፕ በደህና መጡ! ✨\n\n` +
-        `📚 Short Note & Worksheet ለማግኘት እና ለ Mobile App ምዝገባ 👉 <a href="https://t.me/SmartX_PreRegister_bot?start=ref_7471102761">@SmartX_PreRegister_bot</a> ይጫኑ!`;
+        `📚 Short Note & Worksheet ለማግኘት እና ለ Mobile App ምዝገባ 👉 @SmartX_PreRegister_bot ይጫኑ!`;
 
       const sentWelcome = await sendSimpleTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, welcomeText);
       if (sentWelcome && sentWelcome.message_id) {
