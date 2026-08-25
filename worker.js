@@ -251,7 +251,7 @@ async function handleTelegramUpdate(update, env, ctx) {
   }
 
   // Step 5: Construct Chat History Context
-  let history = CHAT_HISTORIES.get(chatId) || [];
+  // history is already retrieved at the top of the function
 
   // Check if user is replying to a previous message
   if (message.reply_to_message) {
