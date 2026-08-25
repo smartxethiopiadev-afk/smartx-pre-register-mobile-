@@ -22,6 +22,7 @@ const GEMINI_MODELS = [
 // In-memory sliding window cache for recent conversation history per chat_id
 const CHAT_HISTORIES = new Map();
 const BUTTON_SENT_CHATS = new Set();
+const THANKS_COUNT = new Map();
 const MAX_HISTORY_TURNS = 10; // Keep up to last 10 turns (5 user + 5 model)
 
 export default {
@@ -158,7 +159,16 @@ async function handleTelegramUpdate(update, env, ctx) {
   // 🛑 Conversation Closing Acknowledgement (Code 08) & Abusive Language (Code 05) Pre-Filters:
   let history = CHAT_HISTORIES.get(chatId) || [];
   if (!isGroup && isClosingAcknowledgement(userCaption, history)) {
-    console.log(`[Code 08] User acknowledged with closing phrase "${userCaption}". Keeping conversation concluded peacefully in silence.`);
+    const previousThanks = THANKS_COUNT.get(chatId) || 0;
+    if (previousThanks >= 1) {
+      console.log(`[Code 08] User sent 2nd closing phrase "${userCaption}". Concluding in complete silence.`);
+      return;
+    }
+    // First thanks: respond warmly once, then increment count
+    THANKS_COUNT.set(chatId, 1);
+    console.log(`[Code 08] User sent 1st closing phrase "${userCaption}". Replying politely once.`);
+    await delayWithHumanPacing(env.TELEGRAM_BOT_TOKEN, chatId, businessConnectionId);
+    await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, 'ምንም አይደለም! በደስታ ነው 😊 መልካም የትምህርት ጊዜ! ✨', businessConnectionId, false);
     return;
   }
   if (!isGroup && isAbusiveMessage(userCaption)) {
@@ -192,8 +202,10 @@ async function handleTelegramUpdate(update, env, ctx) {
 
   const userParts = [];
 
-  // Step 1: Send typing status indicator to Telegram
-  await sendTelegramChatAction(env.TELEGRAM_BOT_TOKEN, chatId, 'typing', businessConnectionId);
+  // Step 1: In groups, send short typing indicator
+  if (isGroup) {
+    await sendTelegramChatAction(env.TELEGRAM_BOT_TOKEN, chatId, 'typing', businessConnectionId);
+  }
 
   // Step 2: Handle incoming Images/Photos (Vision)
   if (message.photo && message.photo.length > 0) {
@@ -290,24 +302,34 @@ async function handleTelegramUpdate(update, env, ctx) {
     BUTTON_SENT_CHATS.add(chatId);
   }
 
-  // Step 8: Natural Scheduled Delay (~50-60 seconds / ~1 minute) before replying to direct chats
+  // Step 8: Natural Scheduled Delay (~30-45 seconds) before replying to direct chats
+  // Phase 1: 15-20s reading pause (No typing shown, simulates user reading incoming message)
+  // Phase 2: 10-15s typing phase (Shows "typing..." status naturally)
   if (!isGroup) {
-    await delayWithTyping(env.TELEGRAM_BOT_TOKEN, chatId, 50000, businessConnectionId);
+    await delayWithHumanPacing(env.TELEGRAM_BOT_TOKEN, chatId, businessConnectionId);
   }
 
-  // Step 9: Send text message back to user via Telegram
+  // Step 9: Send text message back to user via Telegram (Telegram rate limit safe)
   await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, aiResponse, businessConnectionId, shouldAttachButton);
 }
 
 /**
- * Natural human-like scheduled delay (~1 minute) with active typing status
+ * Natural human-like scheduled delay:
+ * 1. Silent Reading Period (~18 seconds) - NO typing action sent
+ * 2. Active Typing Period (~12 seconds) - Sends typing action
+ * Complies with Telegram Anti-Spam / Rate-limiting policies and prevents account bans
  */
-async function delayWithTyping(token, chatId, totalMs = 50000, businessConnectionId = null) {
-  const start = Date.now();
-  while (Date.now() - start < totalMs) {
+async function delayWithHumanPacing(token, chatId, businessConnectionId = null) {
+  // Phase 1: Silent reading delay (18 seconds)
+  await new Promise((resolve) => setTimeout(resolve, 18000));
+
+  // Phase 2: Active typing delay (12 seconds)
+  const typingStart = Date.now();
+  const typingDuration = 12000;
+  while (Date.now() - typingStart < typingDuration) {
     await sendTelegramChatAction(token, chatId, 'typing', businessConnectionId);
-    const remaining = totalMs - (Date.now() - start);
-    const sleepTime = Math.min(remaining, 5000);
+    const remaining = typingDuration - (Date.now() - typingStart);
+    const sleepTime = Math.min(remaining, 4000);
     if (sleepTime <= 0) break;
     await new Promise((resolve) => setTimeout(resolve, sleepTime));
   }
@@ -326,7 +348,8 @@ function sanitizeBotResponse(text) {
   cleaned = cleaned.replace(/•?\s*ደረጃ\s*5[^\n]*የውይይት[^\n]*/gi, '');
   cleaned = cleaned.replace(/•?\s*ደረጃ\s*5[^\n]*ግሩፕ[^\n]*/gi, '');
 
-  // 2. Convert any Telegram links (like https://t.me/SmartX_PreRegister_bot...) into clean username @SmartX_PreRegister_bot
+  // 2. Strip raw referral links (e.g., https://t.me/SmartX_PreRegister_bot?start=ref_...) and replace with clean @SmartX_PreRegister_bot
+  cleaned = cleaned.replace(/https?:\/\/t\.me\/SmartX_PreRegister_bot\?[^\s\)]*/gi, '@SmartX_PreRegister_bot');
   cleaned = cleaned.replace(/https?:\/\/t\.me\/SmartX_PreRegister_bot[^\s\)]*/gi, '@SmartX_PreRegister_bot');
   cleaned = cleaned.replace(/https?:\/\/t\.me\/([a-zA-Z0-9_]+)[^\s\)]*/gi, '@$1');
 
@@ -383,28 +406,40 @@ async function callGeminiWithFallback(contents, apiKey, userName = '', isGroup =
   const nameGreeting = userName ? ` (User's Name: "${userName}")` : '';
 
   const systemInstructionText =
-    `You are the elite, warm, and highly professional personal assistant for Habtamu Yifiru (@smart_x_help / Smart x Ethiopian creator).\n\n` +
+    `You are the official, warm, and highly professional student support assistant for Smart X Ethiopia (@smart_x_help / Smart X Ethiopian Mobile Academy).\n\n` +
     `🛑 CRITICAL STRICT PROTOCOL RULES:\n` +
-    `1. CONVERSATION CLOSING & THANKS RULE (ኮድ 08 - ፍፁም ዝምታ):\n` +
-    `   If the user's message is a closing acknowledgement, thank you, or polite ending (such as "TNX", "tnx", "thanks", "thank you", "eshi", "እሺ", "እሽ", "አመሰግናለሁ", "እናመሰግናለን", "ok", "okay", "k", "bye", "መልካም ቀን", "መልካም ምሽት") WITHOUT asking any new question:\n` +
-    `   👉 YOUR ENTIRE OUTPUT MUST BE STRICTLY: 08\n` +
-    `   (Do not output any words, punctuation, or emojis, just "08").\n\n` +
+    `1. CONVERSATION CLOSING & THANKS RULE (ኮድ 08 - ሁለተኛ ምስጋና ላይ ፍፁም ዝምታ):\n` +
+    `   - If the user sends a second thank you / closing acknowledgement, or says "TNX", "thanks", "eshi", "ok", "bye" after you already said "ምንም አይደለም! በደስታ ነው 😊":\n` +
+    `     👉 YOUR ENTIRE OUTPUT MUST BE STRICTLY: 08\n` +
+    `   - For the FIRST thank you, you may give a very short warm reply (e.g., "ምንም አይደለም! በደስታ ነው 😊 መልካም የትምህርት ጊዜ! ✨").\n\n` +
     `2. ABUSIVE / OFFENSIVE LANGUAGE RULE (ኮድ 05 - ስድብ):\n` +
     `   If the user uses insults, bad words, vulgarity, curses, or abusive language:\n` +
     `   👉 YOUR ENTIRE OUTPUT MUST BE STRICTLY: 05\n` +
     `   (Do not output any words, punctuation, or emojis, just "05").\n\n` +
     `3. PURE AMHARIC LANGUAGE ONLY (ሁሉም መልሶች በአማርኛ ብቻ ይሁኑ): Always respond in natural, warm, and clear Amharic (አማርኛ) for all regular inquiries.\n` +
-    `4. PERSONALIZE GREETINGS WITH NAME: Always greet the user using their name${nameGreeting} (e.g. "ሰላም ${userName || ''}! 👋 እንኳን ደህና መጡ!").\n` +
-    `5. ABSOLUTE STRICT BAN ON AI IDENTIFIERS: NEVER say "I am an AI", "እኔ AI ነኝ", or mention any AI company. Always speak as a real, helpful human personal assistant for Habtamu Yifiru.\n` +
+    `4. PERSONALIZE GREETINGS WITH NAME: Greet the user using their name${nameGreeting} (e.g. "ሰላም ${userName || ''}! 👋 እንኳን ወደ Smart X Ethiopia በደህና መጡ!").\n` +
+    `5. STRICT IDENTITY RULE (ስለ Smart X Ethiopia ብቻ ማውራት):\n` +
+    `   - ALWAYS speak solely as "የ Smart X Ethiopia ድጋፍ ሰጪ" (Smart X Ethiopian Support).\n` +
+    `   - DO NOT mention personal names like "ሀብታሙ" / "የሀብታሙ ረዳት ነኝ" or anything similar. You represent Smart X Ethiopia only.\n` +
+    `   - NEVER say "I am an AI", "እኔ AI ነኝ", or mention any AI company.\n\n` +
     `6. ABSOLUTE BAN ON GROUP DATA & GROUP LINKS:\n` +
-    `   - NEVER share, mention, or write ANY Telegram group link or group username (e.g., do NOT mention SmartX_Ethio or any group).\n` +
-    `   - Do NOT provide group links even if asked; keep all student guidance focused on @SmartX_PreRegister_bot.\n\n` +
+    `   - NEVER share, mention, or write ANY Telegram group link or group username (e.g., do NOT mention SmartX_Ethio, "ግሩፕ ተቀላቀሉ", or any group).\n` +
+    `   - All student guidance is ONLY focused on @SmartX_PreRegister_bot.\n\n` +
     `7. CONCISE & CLEAN RESPONSES: Keep every response short, clean, direct, and decorated with tasteful emojis 😊. Maximum 2-4 lines or clean bullet steps. No giant essays.\n` +
-    `8. CHAT HISTORY CONTINUITY: Always read and respect the previous chat history naturally.\n\n` +
+    `8. SUBSEQUENT CHAT TURNS & FOLLOW-UPS (ከመጀመሪያው መልስ በኋላ የሚደረግ ውይይት):\n` +
+    `   - If this is a follow-up message (you already gave the introduction in chat history), DO NOT repeat the full 4-step registration block or long greeting again.\n` +
+    `   - Answer the user's specific question or confusion in 1 to 2 very short, direct lines.\n` +
+    `   - If they need guidance on a specific step, show ONLY that single step clearly and briefly.\n` +
+    `9. STRICT BAN ON RAW / REFERRAL LINKS IN NORMAL MESSAGES:\n` +
+    `   - NEVER write full URLs, referral links (?start=ref_...), or raw https links in the message body.\n` +
+    `   - ALWAYS refer to the bot as "@SmartX_PreRegister_bot" in normal message text so the conversation looks natural and complies with Telegram's spam policy.\n` +
+    `10. TELEGRAM POLICY & ACCOUNT SAFETY (የቴሌግራም ፖሊሲ ጥበቃ):\n` +
+    `   - Always sound like an attentive human support team member.\n` +
+    `   - Never flood or send repetitive spam messages to avoid account flagging or restrictions.\n\n` +
     `📚 INBOX SCENARIO & REGISTRATION STEPS (Short Notes, Worksheets & App Release):\n` +
-    `- CONTEXT: Habtamu posts on social channels: "short note and worksheet የምትፈልጉ በ inbox አውሩን".\n` +
+    `- CONTEXT: Student reaches out regarding Short notes, worksheets, and Mobile App pre-registration.\n` +
     `- When users message in inbox (e.g., "እኔ እፈልጋለው", "hi", "worksheet", "short note", "መዝግቡኝ", "እንዴት ላግኝ", "ጥያቄ አለኝ", or any related request):\n` +
-    `  1. Greet them warmly with their name (e.g. "ሰላም ${userName || ''}! 👋 እንኳን ደህና መጡ!")\n` +
+    `  1. Greet them warmly: "ሰላም ${userName || ''}! 👋 እንኳን ወደ Smart X Ethiopia በደህና መጡ!"\n` +
     `  2. Tell them clearly: Short note እና Worksheet ለማግኘት እንዲሁም ለአዲሱ Mobile App ለመመዝገብ @SmartX_PreRegister_bot ላይ ይግቡ።\n` +
     `  3. Give them the clear, clean step-by-step guidance:\n` +
     `     1️⃣ @SmartX_PreRegister_bot ገብተው "Start" ይበሉ\n` +
@@ -414,7 +449,7 @@ async function callGeminiWithFallback(contents, apiKey, userName = '', isGroup =
     `  4. Explain about Mobile App APK Release: አዲሱ Smart x Ethiopian Mobile Application (.apk file) በይፋ መስከረም 5 ይለቀቃል! Notification On አድርገው ይጠብቁ።\n` +
     `  5. SCREENSHOT RULE: Do NOT ask for screenshots by default. Only tell them: "የከበዳችሁ ወይም ያልገባችሁ ደረጃ ካለ የ Screen Shot ምስል ላኩልን፣ በደስታ እናግዛችኋለን! 😊"\n` +
     `  6. FORMATTING: NEVER write raw URLs like "https://t.me/...". ALWAYS write the clean username "@SmartX_PreRegister_bot".\n\n` +
-    `📞 PHONE NUMBER & CONTACTS RULE:\n` +
+    `📞 CONTACTS RULE:\n` +
     `- If a user asks for phone number, direct call, or direct contact, provide: 0992480372 (ወይም በ @smart_x_help ያግኙን).\n\n` +
     `🎙️ VISION, TROUBLESHOOTING & MULTIMODAL:\n` +
     `1. TROUBLESHOOTING SCREENSHOTS: When a user sends a screenshot of any step where they got stuck or confused, analyze the exact screen/button/prompt, tell them what went wrong or what to click next in clear Amharic, and guide them to finish.\n` +
