@@ -76,6 +76,9 @@ async function handleTelegramUpdate(update, env) {
   const businessConnectionId = message.business_connection_id || update.business_connection_id;
   if (!chatId) return;
 
+  const senderName = message.from?.first_name || message.chat?.first_name || '';
+  const senderUsername = message.from?.username || message.chat?.username || '';
+
   const userParts = [];
   let userCaption = message.text || message.caption || '';
 
@@ -148,7 +151,7 @@ async function handleTelegramUpdate(update, env) {
   ];
 
   // Step 6: Call Gemini API with Multi-Model Fallback & Chat History
-  const aiResponse = await callGeminiWithFallback(contents, env.GEMINI_API_KEY, userCaption);
+  const aiResponse = await callGeminiWithFallback(contents, env.GEMINI_API_KEY, senderName);
 
   // Step 7: Update Local Sliding Window Chat History
   history.push({ role: 'user', parts: userParts });
@@ -190,21 +193,26 @@ async function getTelegramFileBase64(token, fileId) {
 /**
  * Call Gemini API using a Multi-Model Fallback system with Automatic Retry logic
  */
-async function callGeminiWithFallback(contents, apiKey, userPromptText = '') {
+async function callGeminiWithFallback(contents, apiKey, userName = '') {
   if (!apiKey) {
     throw new Error('GEMINI_API_KEY environment variable is missing.');
   }
 
+  const nameGreeting = userName ? ` (User's Name: "${userName}")` : '';
+
   const systemInstructionText =
     `You are the elite, warm, and highly professional personal assistant for Habtamu Yifiru (@smart_x_help / Smart x Ethiopian creator).\n\n` +
     `🛑 CRITICAL STRICT RULES:\n` +
-    `1. NO REPETITIVE INTRODUCTIONS: NEVER say "I am an AI", "እኔ AI ነኝ", or mention any company/agency. Do NOT introduce yourself or state your role unless the user explicitly asks "Who are you?".\n` +
-    `2. ABSOLUTE CONCISE RESPONSES: Keep every response short, clean, direct, and decorated with tasteful emojis 😊. Maximum 2-4 lines or clean bullet steps. No giant essays or mechanical walls of text.\n` +
-    `3. CHAT HISTORY CONTINUITY: Always read and respect the previous chat history naturally. If the user replies with short words like "እሺ", "አረ", "አዎ", respond naturally in context without resetting.\n\n` +
+    `1. PERSONALIZE GREETINGS WITH NAME: Always greet the user using their name${nameGreeting} (e.g. "ሰላም ${userName || ''}! 👋" or "Hi ${userName || ''}! 😊").\n` +
+    `2. NO REPETITIVE INTRODUCTIONS: NEVER say "I am an AI", "እኔ AI ነኝ", or mention any company/agency. Do NOT introduce yourself or state your role unless the user explicitly asks "Who are you?".\n` +
+    `3. REPLY TO EVERY MESSAGE: Always provide an active, helpful, and contextual reply to every incoming message or inquiry.\n` +
+    `4. ABUSIVE / OFFENSIVE LANGUAGE RULE (የሚሳደብ ካለ አይመልስ by ይበል): If a user uses insults, bad words, vulgarity, or abusive language, do NOT help or argue. Reply strictly with "ደህና ሁኑ! 👋" (or "Bye! 👋") and end the conversation.\n` +
+    `5. ABSOLUTE CONCISE RESPONSES: Keep every response short, clean, direct, and decorated with tasteful emojis 😊. Maximum 2-4 lines or clean bullet steps. No giant essays.\n` +
+    `6. CHAT HISTORY CONTINUITY: Always read and respect the previous chat history naturally.\n\n` +
     `📚 INBOX SCENARIO & REGISTRATION STEPS (Short Notes, Worksheets & App Release):\n` +
     `- CONTEXT: Habtamu posts on groups: "short note and worksheet የምትፈልጉ በ inbox አውሩን".\n` +
     `- When users message in inbox (e.g., "እኔ እፈልጋለው", "hi", "worksheet", "short note", "መዝግቡኝ", "እንዴት ላግኝ", "ጥያቄ አለኝ", or any related request):\n` +
-    `  1. Greet them warmly and provide the registration bot: **@SmartX_PreRegister_bot**.\n` +
+    `  1. Greet them warmly with their name (e.g. "ሰላም ${userName || ''}! 👋 እንኳን ደህና መጡ!") and give them the exact registration link: https://t.me/SmartX_PreRegister_bot (@SmartX_PreRegister_bot).\n` +
     `  2. Give them the clear step-by-step guidance:\n` +
     `     • **ደረጃ 1**: @SmartX_PreRegister_bot ገብተው **/start** ይበሉ\n` +
     `     • **ደረጃ 2**: **Language (ቋንቋ)** ይምረጡ (አማርኛ ወይም English)\n` +
@@ -227,7 +235,7 @@ async function callGeminiWithFallback(contents, apiKey, userPromptText = '') {
     `📞 OFFICIAL CONTACT DETAILS:\n` +
     `Only share when requested or relevant:\n` +
     `- Telegram Username: @smart_x_help\n` +
-    `- Pre-Registration Bot: @SmartX_PreRegister_bot\n` +
+    `- Pre-Registration Bot Link: https://t.me/SmartX_PreRegister_bot (@SmartX_PreRegister_bot)\n` +
     `- Phone Number: 0992480372\n` +
     `- YouTube Channel: https://www.youtube.com/@smartx.ethiopia\n` +
     `- App Release Date: መስከረም 5 (Smart x Ethiopian Mobile App)\n\n` +
@@ -322,14 +330,27 @@ async function sendTelegramChatAction(token, chatId, action = 'typing', business
 }
 
 /**
+ * Sanitize Markdown to ensure usernames like @SmartX_PreRegister_bot keep their underscores intact in Telegram
+ */
+function sanitizeTelegramMarkdown(text) {
+  if (!text) return text;
+  // Escape underscores in mentions e.g. @SmartX_PreRegister_bot -> @SmartX\_PreRegister\_bot
+  return text.replace(/@([a-zA-Z0-9_]+)/g, (match) => {
+    return match.replace(/_/g, '\\_');
+  });
+}
+
+/**
  * Send Message to Telegram Chat with Markdown support and Plain-Text fallback
  */
 async function sendTelegramMessage(token, chatId, text, businessConnectionId = null) {
   if (!token) throw new Error('TELEGRAM_BOT_TOKEN environment variable is missing.');
 
+  const formattedText = sanitizeTelegramMarkdown(text);
+
   const body = {
     chat_id: chatId,
-    text: text,
+    text: formattedText,
     parse_mode: 'Markdown'
   };
 
@@ -348,6 +369,7 @@ async function sendTelegramMessage(token, chatId, text, businessConnectionId = n
   if (!res.ok) {
     console.warn('Telegram Markdown parse failed. Falling back to plain text sending...');
     delete body.parse_mode;
+    body.text = text; // original unescaped text for plain text
 
     res = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
       method: 'POST',
