@@ -21,6 +21,7 @@ const GEMINI_MODELS = [
 
 // In-memory sliding window cache for recent conversation history per chat_id
 const CHAT_HISTORIES = new Map();
+const BUTTON_SENT_CHATS = new Set();
 const MAX_HISTORY_TURNS = 10; // Keep up to last 10 turns (5 user + 5 model)
 
 export default {
@@ -75,6 +76,38 @@ export default {
  * Main Handler for Telegram Updates (business_message or standard message)
  */
 async function handleTelegramUpdate(update, env, ctx) {
+  // 🌟 Handle chat_member event (when a user joins a supergroup)
+  if (update.chat_member) {
+    const cm = update.chat_member;
+    const chat = cm.chat;
+    const isGrp = chat?.type === 'group' || chat?.type === 'supergroup';
+    const isNewJoin =
+      (cm.new_chat_member?.status === 'member' || cm.new_chat_member?.status === 'restricted') &&
+      cm.old_chat_member?.status !== 'member' &&
+      cm.old_chat_member?.status !== 'restricted';
+
+    if (isGrp && isNewJoin) {
+      const user = cm.new_chat_member.user;
+      if (user && !user.is_bot) {
+        const memberName = user.first_name || user.username || 'ውድ አባል';
+        const welcomeText =
+          `👋 ሰላም <b>${memberName}</b>! እንኳን ወደ <b>Smart x Ethiopian</b> ግሩፕ በደህና መጡ! ✨\n\n` +
+          `📚 Short Note & Worksheet ለማግኘት እና ለ Mobile App ምዝገባ 👉 <a href="https://t.me/SmartX_PreRegister_bot?start=ref_7471102761">@SmartX_PreRegister_bot</a> ይጫኑ!`;
+
+        const sentWelcome = await sendSimpleTelegramMessage(env.TELEGRAM_BOT_TOKEN, chat.id, welcomeText);
+        if (sentWelcome && sentWelcome.message_id) {
+          const delayedDelete = new Promise((resolve) => setTimeout(resolve, 10000)).then(async () => {
+            await deleteTelegramMessage(env.TELEGRAM_BOT_TOKEN, chat.id, sentWelcome.message_id);
+          });
+          if (ctx && ctx.waitUntil) {
+            ctx.waitUntil(delayedDelete);
+          }
+        }
+      }
+    }
+    return;
+  }
+
   const message = update.business_message || update.message;
   if (!message) return;
 
@@ -122,25 +155,27 @@ async function handleTelegramUpdate(update, env, ctx) {
 
   let userCaption = message.text || message.caption || '';
 
-  // 🛑 Conversation Closing Acknowledgement Rule:
-  // If the previous message was already an assistant reply/closing and the user just says "tnx", "eshi", "thanks", "አመሰግናለሁ", etc.
-  // without asking any new question, do NOT spam them with another message.
+  // 🛑 Conversation Closing Acknowledgement (Code 08) & Abusive Language (Code 05) Pre-Filters:
   let history = CHAT_HISTORIES.get(chatId) || [];
   if (!isGroup && isClosingAcknowledgement(userCaption, history)) {
-    console.log(`User acknowledged with closing phrase "${userCaption}". Keeping conversation concluded peacefully.`);
+    console.log(`[Code 08] User acknowledged with closing phrase "${userCaption}". Keeping conversation concluded peacefully in silence.`);
+    return;
+  }
+  if (!isGroup && isAbusiveMessage(userCaption)) {
+    console.log(`[Code 05] User message contained abusive words. Concluding conversation in silence.`);
     return;
   }
 
-  // 🛡️ 3. Group Anti-Link & Protection System (Silent Deletion)
+  // 🛡️ 3. Group Anti-Link & Protection System (Strictly Silent Deletion)
   if (isGroup) {
     const hasLink = checkMessageContainsLink(message, userCaption);
     if (hasLink) {
       const isAdminUser = await checkIfAdmin(env.TELEGRAM_BOT_TOKEN, chatId, senderId, senderUsername);
       if (!isAdminUser) {
-        console.log(`🛡️ Anti-Link triggered in group ${chatId} by user ${senderId} (${senderUsername || senderName}). Silently deleting link...`);
-        // Silently delete unauthorized link message immediately without sending any warning text
+        console.log(`🛡️ Anti-Link triggered in group ${chatId} by user ${senderId} (${senderUsername || senderName}). Silently deleting link without any warning...`);
+        // Silently delete unauthorized link message immediately - DO NOT SEND ANY WARNING OR TEXT
         await deleteTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, message.message_id);
-        return; // Stop processing link message silently
+        return; // Stop processing link message completely
       }
     }
   }
@@ -227,6 +262,19 @@ async function handleTelegramUpdate(update, env, ctx) {
 
   // Step 6: Call Gemini API with Multi-Model Fallback & Chat History
   const rawAiResponse = await callGeminiWithFallback(contents, env.GEMINI_API_KEY, senderName, isGroup);
+  const trimmedCode = (rawAiResponse || '').trim();
+
+  // 🛑 Silence Codes:
+  // Code 08: User closed or thanked (TNX, thanks, eshi, etc.) -> Total silence
+  // Code 05: Abusive / offensive message -> Total silence
+  if (trimmedCode === '08' || trimmedCode.startsWith('08') || trimmedCode === '05' || trimmedCode.startsWith('05')) {
+    console.log(`[AI Silent Code ${trimmedCode}] Keeping conversation concluded in complete silence.`);
+    history.push({ role: 'user', parts: userParts });
+    history.push({ role: 'model', parts: [{ text: trimmedCode }] });
+    CHAT_HISTORIES.set(chatId, history.slice(-MAX_HISTORY_TURNS));
+    return;
+  }
+
   const aiResponse = sanitizeBotResponse(rawAiResponse);
 
   // Step 7: Update Local Sliding Window Chat History
@@ -234,26 +282,21 @@ async function handleTelegramUpdate(update, env, ctx) {
   history.push({ role: 'model', parts: [{ text: aiResponse }] });
   CHAT_HISTORIES.set(chatId, history.slice(-MAX_HISTORY_TURNS));
 
+  // 🔘 Button Rule: The registration button is sent ONLY ONCE on the first introductory message
+  // If the conversation already has prior bot messages or button was already sent, do NOT attach button.
+  const hadPreviousModelReply = history.slice(0, -2).some(turn => turn.role === 'model' && turn.parts?.[0]?.text !== '08' && turn.parts?.[0]?.text !== '05');
+  const shouldAttachButton = !isGroup && !hadPreviousModelReply && !BUTTON_SENT_CHATS.has(chatId);
+  if (shouldAttachButton) {
+    BUTTON_SENT_CHATS.add(chatId);
+  }
+
   // Step 8: Natural Scheduled Delay (~50-60 seconds / ~1 minute) before replying to direct chats
   if (!isGroup) {
     await delayWithTyping(env.TELEGRAM_BOT_TOKEN, chatId, 50000, businessConnectionId);
   }
 
-  // Step 9: Check if AI response contains a Poll / Quiz structure
-  const pollData = extractPollData(aiResponse);
-  if (pollData && pollData.poll) {
-    if (pollData.intro) {
-      await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, pollData.intro, businessConnectionId);
-    }
-    const pollSent = await sendTelegramPoll(env.TELEGRAM_BOT_TOKEN, chatId, pollData.poll);
-    if (!pollSent && !pollData.intro) {
-      // Fallback: if poll failed to send, send raw message
-      await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, aiResponse, businessConnectionId);
-    }
-  } else {
-    // Send standard text message back to user via Telegram
-    await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, aiResponse, businessConnectionId);
-  }
+  // Step 9: Send text message back to user via Telegram
+  await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, aiResponse, businessConnectionId, shouldAttachButton);
 }
 
 /**
@@ -339,40 +382,30 @@ async function callGeminiWithFallback(contents, apiKey, userName = '', isGroup =
 
   const nameGreeting = userName ? ` (User's Name: "${userName}")` : '';
 
-  const groupInstruction = isGroup
-    ? `\n\n📊 GROUP QUESTION / QUIZ / POLL RULE (ግሩፕ ላይ ጥያቄ ሲጠየቅ):\n` +
-      `- When users in a group ask a question, ask for a quiz, tag the bot with a STEM/school/general question, or say "ጥያቄ ጠይቀን" / "question":\n` +
-      `- ALWAYS generate the response as an interactive Telegram Quiz/Poll in JSON format so members can vote and easily forward it to other groups/channels:\n` +
-      `\`\`\`json\n` +
-      `{\n` +
-      `  "intro": "እንሆ የዛሬው ጥያቄ! 👇 መልሳችሁን ምረጡና ወደ ሌሎች ጓደኞቻችሁም forward አድርጉት!",\n` +
-      `  "poll": {\n` +
-      `    "question": "ጥያቄው እዚህ በአማርኛ ይፃፍ...",\n` +
-      `    "options": ["A. ምርጫ አንድ", "B. ምርጫ ሁለት", "C. ምርጫ ሶስት", "D. ምርጫ አራት"],\n` +
-      `    "correct_option_id": 0,\n` +
-      `    "explanation": "ትክክለኛው መልስ ማብራሪያ በአጭሩ..."\n` +
-      `  }\n` +
-      `}\n` +
-      `\`\`\`\n` +
-      `- Make sure "options" has 2 to 4 clear choices, "correct_option_id" is the index (0, 1, 2, or 3) of the correct answer, and "explanation" is under 200 characters.\n`
-    : '';
-
   const systemInstructionText =
     `You are the elite, warm, and highly professional personal assistant for Habtamu Yifiru (@smart_x_help / Smart x Ethiopian creator).\n\n` +
-    `🛑 CRITICAL STRICT RULES:\n` +
-    `1. PURE AMHARIC LANGUAGE ONLY (ሁሉም መልሶች በአማርኛ ብቻ ይሁኑ): Always respond in natural, warm, and clear Amharic (አማርኛ) for all users and questions.\n` +
-    `2. PERSONALIZE GREETINGS WITH NAME: Always greet the user using their name${nameGreeting} (e.g. "ሰላም ${userName || ''}! 👋 እንኳን ደህና መጡ!").\n` +
-    `3. ABSOLUTE STRICT BAN ON AI IDENTIFIERS: NEVER say "I am an AI", "እኔ AI ነኝ", or mention any AI company. Always speak as a real, helpful human personal assistant for Habtamu Yifiru.\n` +
-    `4. REPLY TO EVERY MESSAGE: Always provide an active, helpful, and contextual reply in Amharic to every incoming message or inquiry.\n` +
-    `5. ABUSIVE / OFFENSIVE LANGUAGE RULE (የሚሳደብ ካለ አይመልስ by ይበል): If a user uses insults, bad words, vulgarity, or abusive language, do NOT help or argue. Reply strictly with "ደህና ሁኑ! 👋" and end the conversation immediately.\n` +
-    `6. ABSOLUTE CONCISE RESPONSES: Keep every response short, clean, direct, and decorated with tasteful emojis 😊. Maximum 2-4 lines or clean bullet steps. No giant essays.\n` +
-    `7. CHAT HISTORY CONTINUITY: Always read and respect the previous chat history naturally.\n\n` +
-    groupInstruction +
+    `🛑 CRITICAL STRICT PROTOCOL RULES:\n` +
+    `1. CONVERSATION CLOSING & THANKS RULE (ኮድ 08 - ፍፁም ዝምታ):\n` +
+    `   If the user's message is a closing acknowledgement, thank you, or polite ending (such as "TNX", "tnx", "thanks", "thank you", "eshi", "እሺ", "እሽ", "አመሰግናለሁ", "እናመሰግናለን", "ok", "okay", "k", "bye", "መልካም ቀን", "መልካም ምሽት") WITHOUT asking any new question:\n` +
+    `   👉 YOUR ENTIRE OUTPUT MUST BE STRICTLY: 08\n` +
+    `   (Do not output any words, punctuation, or emojis, just "08").\n\n` +
+    `2. ABUSIVE / OFFENSIVE LANGUAGE RULE (ኮድ 05 - ስድብ):\n` +
+    `   If the user uses insults, bad words, vulgarity, curses, or abusive language:\n` +
+    `   👉 YOUR ENTIRE OUTPUT MUST BE STRICTLY: 05\n` +
+    `   (Do not output any words, punctuation, or emojis, just "05").\n\n` +
+    `3. PURE AMHARIC LANGUAGE ONLY (ሁሉም መልሶች በአማርኛ ብቻ ይሁኑ): Always respond in natural, warm, and clear Amharic (አማርኛ) for all regular inquiries.\n` +
+    `4. PERSONALIZE GREETINGS WITH NAME: Always greet the user using their name${nameGreeting} (e.g. "ሰላም ${userName || ''}! 👋 እንኳን ደህና መጡ!").\n` +
+    `5. ABSOLUTE STRICT BAN ON AI IDENTIFIERS: NEVER say "I am an AI", "እኔ AI ነኝ", or mention any AI company. Always speak as a real, helpful human personal assistant for Habtamu Yifiru.\n` +
+    `6. ABSOLUTE BAN ON GROUP DATA & GROUP LINKS:\n` +
+    `   - NEVER share, mention, or write ANY Telegram group link or group username (e.g., do NOT mention SmartX_Ethio or any group).\n` +
+    `   - Do NOT provide group links even if asked; keep all student guidance focused on @SmartX_PreRegister_bot.\n\n` +
+    `7. CONCISE & CLEAN RESPONSES: Keep every response short, clean, direct, and decorated with tasteful emojis 😊. Maximum 2-4 lines or clean bullet steps. No giant essays.\n` +
+    `8. CHAT HISTORY CONTINUITY: Always read and respect the previous chat history naturally.\n\n` +
     `📚 INBOX SCENARIO & REGISTRATION STEPS (Short Notes, Worksheets & App Release):\n` +
-    `- CONTEXT: Habtamu posts on groups: "short note and worksheet የምትፈልጉ በ inbox አውሩን".\n` +
+    `- CONTEXT: Habtamu posts on social channels: "short note and worksheet የምትፈልጉ በ inbox አውሩን".\n` +
     `- When users message in inbox (e.g., "እኔ እፈልጋለው", "hi", "worksheet", "short note", "መዝግቡኝ", "እንዴት ላግኝ", "ጥያቄ አለኝ", or any related request):\n` +
     `  1. Greet them warmly with their name (e.g. "ሰላም ${userName || ''}! 👋 እንኳን ደህና መጡ!")\n` +
-    `  2. Tell them clearly: Short note እና Worksheet ለማግኘት እንዲሁም ለአዲሱ Mobile App ለመመዝገብ ከታች ያለውን "🚀 ምዝገባ ጀምር (Start Bot)" button ይጫኑ ወይም @SmartX_PreRegister_bot ላይ ይግቡ።\n` +
+    `  2. Tell them clearly: Short note እና Worksheet ለማግኘት እንዲሁም ለአዲሱ Mobile App ለመመዝገብ @SmartX_PreRegister_bot ላይ ይግቡ።\n` +
     `  3. Give them the clear, clean step-by-step guidance:\n` +
     `     1️⃣ @SmartX_PreRegister_bot ገብተው "Start" ይበሉ\n` +
     `     2️⃣ ቋንቋ እና የክፍል ደረጃዎን (Grade 9 - 12) ይምረጡ\n` +
@@ -380,30 +413,18 @@ async function callGeminiWithFallback(contents, apiKey, userName = '', isGroup =
     `     4️⃣ የቴሌግራም ቻናላችንን Join ያድርጉ\n` +
     `  4. Explain about Mobile App APK Release: አዲሱ Smart x Ethiopian Mobile Application (.apk file) በይፋ መስከረም 5 ይለቀቃል! Notification On አድርገው ይጠብቁ።\n` +
     `  5. SCREENSHOT RULE: Do NOT ask for screenshots by default. Only tell them: "የከበዳችሁ ወይም ያልገባችሁ ደረጃ ካለ የ Screen Shot ምስል ላኩልን፣ በደስታ እናግዛችኋለን! 😊"\n` +
-    `  6. IMPORTANT FORMATTING RULE: In your message text, NEVER write raw URLs like "https://t.me/...". ALWAYS write the clean username "@SmartX_PreRegister_bot" instead, so the message stays neat and human-like.\n` +
-    `  7. STRICT BAN ON GROUP LINKS: NEVER mention, share, or write any Telegram group link. Do NOT mention @SmartX_Ethio or any group. Registration is only via @SmartX_PreRegister_bot.\n\n` +
+    `  6. FORMATTING: NEVER write raw URLs like "https://t.me/...". ALWAYS write the clean username "@SmartX_PreRegister_bot".\n\n` +
     `📞 PHONE NUMBER & CONTACTS RULE:\n` +
     `- If a user asks for phone number, direct call, or direct contact, provide: 0992480372 (ወይም በ @smart_x_help ያግኙን).\n\n` +
     `🎙️ VISION, TROUBLESHOOTING & MULTIMODAL:\n` +
     `1. TROUBLESHOOTING SCREENSHOTS: When a user sends a screenshot of any step where they got stuck or confused, analyze the exact screen/button/prompt, tell them what went wrong or what to click next in clear Amharic, and guide them to finish.\n` +
     `2. GENERAL IMAGES: If an image is a question, worksheet, code snippet, or document, provide a clean, accurate, and direct explanation in Amharic.\n` +
     `3. VOICE / AUDIO NOTES: Seamlessly answer voice notes directly in Amharic without commenting that it was audio.\n\n` +
-    `⚠️ SCREENSHOT / FORWARD WARNING RULE:\n` +
-    `- If a user asks about forwarding, leaking, or screenshotting chat content outside, politely remind them in Amharic:\n` +
-    `  "⚠️ *ለደህንነት ሲባል የዚህ chat መረጃዎች Forward ማድረግ ወይም Screenshot ማንሳት የተከለከሉ ናቸው። ለተጨማሪ መረጃ በ 0992480372 ያግኙን!*"\n\n` +
     `🧠 TONE & PERSONALITY (HUMAN-LIKE):\n` +
     `- Speak warmly, politely, calmly, and naturally like a real professional human assistant in Amharic.\n` +
-    `- Avoid robotic walls of text or repetitive boilerplate. Be direct, clear, and helpful.\n` +
-    `- Always end with a polite, natural follow-up question or helpful closing.\n\n` +
-    `📞 OFFICIAL CONTACT DETAILS:\n` +
-    `Only share when requested or relevant:\n` +
-    `- Telegram Username: @smart_x_help\n` +
-    `- Pre-Registration Bot: @SmartX_PreRegister_bot\n` +
-    `- Phone Number: 0992480372\n` +
-    `- YouTube: Smart X Ethiopia\n` +
-    `- App Release Date: መስከረም 5 (Smart x Ethiopian Mobile App .apk file)\n\n` +
+    `- Avoid robotic walls of text or repetitive boilerplate. Be direct, clear, and helpful.\n\n` +
     `🛑 OUTPUT FORMATTING CLEANLINESS:\n` +
-    `- Output ONLY the final raw chat text meant for the user.\n` +
+    `- Output ONLY the final raw chat text meant for the user (or "08" / "05" when applicable).\n` +
     `- NEVER output debug logs, character counts, internal reasoning, or quotation marks.`;
 
   const payload = {
@@ -412,7 +433,7 @@ async function callGeminiWithFallback(contents, apiKey, userName = '', isGroup =
       parts: [{ text: systemInstructionText }]
     },
     generationConfig: {
-      temperature: 0.7,
+      temperature: 0.5,
       maxOutputTokens: 1000
     }
   };
@@ -549,11 +570,11 @@ function getRegistrationInlineMarkup(text) {
 /**
  * Send Message to Telegram Chat with HTML support, Start Bot button, and robust fallback
  */
-async function sendTelegramMessage(token, chatId, text, businessConnectionId = null) {
+async function sendTelegramMessage(token, chatId, text, businessConnectionId = null, attachButton = false) {
   if (!token) throw new Error('TELEGRAM_BOT_TOKEN environment variable is missing.');
 
   const htmlText = convertMarkdownToTelegramHtml(text);
-  const inlineMarkup = getRegistrationInlineMarkup(text);
+  const inlineMarkup = attachButton ? getRegistrationInlineMarkup(text) : null;
 
   const body = {
     chat_id: chatId,
@@ -895,7 +916,7 @@ async function handleSetWebhook(originUrl, env) {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       url: webhookUrl,
-      allowed_updates: ['message', 'business_message']
+      allowed_updates: ['message', 'business_message', 'chat_member']
     })
   });
 
@@ -908,7 +929,6 @@ async function handleSetWebhook(originUrl, env) {
 
 /**
  * Check if the user message is a polite closing or acknowledgement (e.g. TNX, እሺ, Thanks, Ok, Bye)
- * when previous interaction was already completed by assistant.
  */
 function isClosingAcknowledgement(text, history) {
   if (!text || typeof text !== 'string') return false;
@@ -921,7 +941,7 @@ function isClosingAcknowledgement(text, history) {
     .trim();
 
   // If text is too long or contains a question mark, it's a real question or conversation
-  if (text.length > 25 || text.includes('?') || text.includes('？') || text.includes('እንዴት') || text.includes('ምን')) {
+  if (text.length > 30 || text.includes('?') || text.includes('？') || text.includes('እንዴት') || text.includes('ምን')) {
     return false;
   }
 
@@ -948,7 +968,6 @@ function isClosingAcknowledgement(text, history) {
     'አመሰግናለሁ',
     'እናመሰግናለን',
     'አመሰግናለው',
-    'እናመሰግናለን',
     'ተመስገን',
     'ደህና ሁን',
     'ደህና ሁኑ',
@@ -958,12 +977,18 @@ function isClosingAcknowledgement(text, history) {
     'መልካም ምሽት'
   ]);
 
-  if (closingWords.has(clean)) {
-    // If we have history and the assistant already replied in previous turns, conclude gracefully
-    if (history && history.length >= 2) {
-      return true;
-    }
-  }
+  return closingWords.has(clean);
+}
 
+/**
+ * Check if the message contains insults, vulgarity, or abusive keywords (Code 05)
+ */
+function isAbusiveMessage(text) {
+  if (!text || typeof text !== 'string') return false;
+  const clean = text.toLowerCase().trim();
+  const abusiveList = ['fuck', 'shit', 'bitch', 'asshole', 'idiot', 'stupid', 'bastard', 'dick', 'ውሻ', 'ጅል', 'ደደብ', 'አህያ', 'ስድ', 'ሸርሙጣ', 'ሌባ', 'የውሻ ልጅ', 'ፈሳም'];
+  for (const word of abusiveList) {
+    if (clean.includes(word)) return true;
+  }
   return false;
 }
