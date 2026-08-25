@@ -212,14 +212,14 @@ async function callGeminiWithFallback(contents, apiKey, userName = '') {
     `📚 INBOX SCENARIO & REGISTRATION STEPS (Short Notes, Worksheets & App Release):\n` +
     `- CONTEXT: Habtamu posts on groups: "short note and worksheet የምትፈልጉ በ inbox አውሩን".\n` +
     `- When users message in inbox (e.g., "እኔ እፈልጋለው", "hi", "worksheet", "short note", "መዝግቡኝ", "እንዴት ላግኝ", "ጥያቄ አለኝ", or any related request):\n` +
-    `  1. Greet them warmly with their name (e.g. "ሰላም ${userName || ''}! 👋 እንኳን ደህና መጡ!") and give them the exact registration link: https://t.me/SmartX_PreRegister_bot (@SmartX_PreRegister_bot).\n` +
+    `  1. Greet them warmly with their name (e.g. "ሰላም ${userName || ''}! 👋 እንኳን ደህና መጡ!") and tell them to click the "🚀 ምዝገባ ጀምር (Start Bot)" button below or visit @SmartX_PreRegister_bot.\n` +
     `  2. Give them the clear step-by-step guidance:\n` +
-    `     • **ደረጃ 1**: @SmartX_PreRegister_bot ገብተው **/start** ይበሉ\n` +
-    `     • **ደረጃ 2**: **Language (ቋንቋ)** ይምረጡ (አማርኛ ወይም English)\n` +
-    `     • **ደረጃ 3**: የክፍል ደረጃዎን ይምረጡ (**Grade 9 - 12**)\n` +
-    `     • **ደረጃ 4**: የፍላጎት ማረጋገጫ **5 አጫጭር ጥያቄዎችን** ይመልሱ\n` +
-    `     • **ደረጃ 5**: ጥያቄዎቹን ሲጨርሱ **Telegram Channel Join** ያድርጉ እና **ስልክ ቁጥርዎን Share ያድርጉ**\n` +
-    `  3. Inform them: **Smart x Ethiopian Mobile Application** በይፋ **መስከረም 5** ይለቀቃል! እርምጃዎቹን አጠናቀው Notification on አድርገው ይጠብቁ።\n` +
+    `     • ደረጃ 1: ከታች ያለውን "🚀 ምዝገባ ጀምር (Start Bot)" Button ይጫኑ ወይም @SmartX_PreRegister_bot ገብተው /start ይበሉ\n` +
+    `     • ደረጃ 2: Language (ቋንቋ) ይምረጡ (አማርኛ ወይም English)\n` +
+    `     • ደረጃ 3: የክፍል ደረጃዎን ይምረጡ (Grade 9 - 12)\n` +
+    `     • ደረጃ 4: የፍላጎት ማረጋገጫ 5 አጫጭር ጥያቄዎችን ይመልሱ\n` +
+    `     • ደረጃ 5: ጥያቄዎቹን ሲጨርሱ Telegram Channel Join ያድርጉ እና ስልክ ቁጥርዎን Share ያድርጉ\n` +
+    `  3. Inform them: Smart x Ethiopian Mobile Application በይፋ መስከረም 5 ይለቀቃል! እርምጃዎቹን አጠናቀው Notification on አድርገው ይጠብቁ።\n` +
     `  4. SCREENSHOT RULE: Do NOT ask for screenshots by default. Only tell them: "የከበዳችሁ ወይም ያልገባችሁ ደረጃ ካለ የ Screen Shot ምስል ላኩልን፣ በደስታ እናግዛችኋለን! 😊"\n\n` +
     `🎙️ VISION, TROUBLESHOOTING & MULTIMODAL:\n` +
     `1. TROUBLESHOOTING SCREENSHOTS: When a user sends a screenshot of any step in @SmartX_PreRegister_bot where they got stuck or confused, analyze the exact screen/button/prompt, tell them what went wrong or what to click next in simple Amharic/English, and guide them to finish.\n` +
@@ -235,7 +235,7 @@ async function callGeminiWithFallback(contents, apiKey, userName = '') {
     `📞 OFFICIAL CONTACT DETAILS:\n` +
     `Only share when requested or relevant:\n` +
     `- Telegram Username: @smart_x_help\n` +
-    `- Pre-Registration Bot Link: https://t.me/SmartX_PreRegister_bot (@SmartX_PreRegister_bot)\n` +
+    `- Pre-Registration Bot Link: @SmartX_PreRegister_bot (https://t.me/SmartX_PreRegister_bot)\n` +
     `- Phone Number: 0992480372\n` +
     `- YouTube Channel: https://www.youtube.com/@smartx.ethiopia\n` +
     `- App Release Date: መስከረም 5 (Smart x Ethiopian Mobile App)\n\n` +
@@ -330,52 +330,112 @@ async function sendTelegramChatAction(token, chatId, action = 'typing', business
 }
 
 /**
- * Sanitize Markdown to ensure usernames like @SmartX_PreRegister_bot keep their underscores intact in Telegram
+ * Convert Markdown text to Telegram-supported HTML safely without breaking usernames or links
  */
-function sanitizeTelegramMarkdown(text) {
-  if (!text) return text;
-  // Escape underscores in mentions e.g. @SmartX_PreRegister_bot -> @SmartX\_PreRegister\_bot
-  return text.replace(/@([a-zA-Z0-9_]+)/g, (match) => {
-    return match.replace(/_/g, '\\_');
-  });
+function convertMarkdownToTelegramHtml(text) {
+  if (!text) return '';
+
+  // Escape basic HTML entities
+  let escaped = text
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+
+  // Bold: **text** -> <b>text</b>
+  escaped = escaped.replace(/\*\*(.*?)\*\*/g, '<b>$1</b>');
+
+  // Inline Code: `text` -> <code>text</code>
+  escaped = escaped.replace(/`([^`]+)`/g, '<code>$1</code>');
+
+  return escaped;
 }
 
 /**
- * Send Message to Telegram Chat with Markdown support and Plain-Text fallback
+ * Generate Inline Keyboard with Start Bot button for registration / bot flow
+ */
+function getRegistrationInlineMarkup(text) {
+  const lower = (text || '').toLowerCase();
+  const shouldAttachButton =
+    lower.includes('smartx') ||
+    lower.includes('preregister') ||
+    lower.includes('bot') ||
+    lower.includes('ምዝገባ') ||
+    lower.includes('ደረጃ') ||
+    lower.includes('short note') ||
+    lower.includes('worksheet') ||
+    lower.includes('መስከረም') ||
+    lower.includes('start') ||
+    lower.includes('ሰላም') ||
+    lower.includes('hi');
+
+  if (shouldAttachButton) {
+    return {
+      inline_keyboard: [
+        [
+          {
+            text: '🚀 ምዝገባ ጀምር (Start Bot) 👉',
+            url: 'https://t.me/SmartX_PreRegister_bot'
+          }
+        ]
+      ]
+    };
+  }
+  return null;
+}
+
+/**
+ * Send Message to Telegram Chat with HTML support, Start Bot button, and robust fallback
  */
 async function sendTelegramMessage(token, chatId, text, businessConnectionId = null) {
   if (!token) throw new Error('TELEGRAM_BOT_TOKEN environment variable is missing.');
 
-  const formattedText = sanitizeTelegramMarkdown(text);
+  const htmlText = convertMarkdownToTelegramHtml(text);
+  const inlineMarkup = getRegistrationInlineMarkup(text);
 
   const body = {
     chat_id: chatId,
-    text: formattedText,
-    parse_mode: 'Markdown'
+    text: htmlText,
+    parse_mode: 'HTML'
   };
+
+  if (inlineMarkup) {
+    body.reply_markup = inlineMarkup;
+  }
 
   if (businessConnectionId) {
     body.business_connection_id = businessConnectionId;
   }
 
-  // Primary Attempt: Send with Markdown formatting
+  // Primary Attempt: Send with HTML formatting and inline button
   let res = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body)
   });
 
-  // Fallback: If Markdown parsing fails on Telegram's side, resend as plain text
+  // Fallback 1: If HTML parse fails, resend as plain text
   if (!res.ok) {
-    console.warn('Telegram Markdown parse failed. Falling back to plain text sending...');
+    console.warn('Telegram HTML parse failed. Falling back to plain text sending...');
     delete body.parse_mode;
-    body.text = text; // original unescaped text for plain text
+    body.text = text; // original plain text
 
     res = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body)
     });
+
+    // Fallback 2: If inline_keyboard fails in any specific client/mode, retry without reply_markup
+    if (!res.ok && body.reply_markup) {
+      console.warn('Telegram reply_markup failed. Retrying without reply_markup...');
+      delete body.reply_markup;
+
+      res = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body)
+      });
+    }
 
     if (!res.ok) {
       const errBody = await res.text();
