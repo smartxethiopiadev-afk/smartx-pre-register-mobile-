@@ -41,7 +41,12 @@ export default {
         // Execute asynchronously using ctx.waitUntil so Telegram receives 200 OK immediately
         // while the 1-minute scheduled delay executes smoothly in the background
         if (ctx && typeof ctx.waitUntil === 'function') {
-          ctx.waitUntil(handleTelegramUpdate(update, env, ctx));
+          ctx.waitUntil(
+            handleTelegramUpdate(update, env, ctx).catch((err) => {
+              console.error('Unhandled Telegram Processing Error in Background Task:', err);
+              return sendAdminErrorAlert(err, env);
+            })
+          );
         } else {
           await handleTelegramUpdate(update, env, ctx);
         }
