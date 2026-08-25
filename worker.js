@@ -277,16 +277,25 @@ function sanitizeBotResponse(text) {
   if (!text) return '';
   let cleaned = text;
 
-  // Remove any mentions of group link or t.me/SmartX_Ethio
-  cleaned = cleaned.replace(/https?:\/\/t\.me\/SmartX_Ethio[^\s]*/gi, '');
+  // 1. Remove any mentions of group link, SmartX_Ethio, or group registration steps
+  cleaned = cleaned.replace(/https?:\/\/t\.me\/SmartX_Ethio[^\s\)]*/gi, '');
   cleaned = cleaned.replace(/@SmartX_Ethio/gi, '');
   cleaned = cleaned.replace(/•?\s*ደረጃ\s*5[^\n]*የውይይት[^\n]*/gi, '');
   cleaned = cleaned.replace(/•?\s*ደረጃ\s*5[^\n]*ግሩፕ[^\n]*/gi, '');
 
-  // Clean raw bot URLs in text body into neat clean mention @SmartX_PreRegister_bot
+  // 2. Convert any Telegram links (like https://t.me/SmartX_PreRegister_bot...) into clean username @SmartX_PreRegister_bot
   cleaned = cleaned.replace(/https?:\/\/t\.me\/SmartX_PreRegister_bot[^\s\)]*/gi, '@SmartX_PreRegister_bot');
+  cleaned = cleaned.replace(/https?:\/\/t\.me\/([a-zA-Z0-9_]+)[^\s\)]*/gi, '@$1');
 
-  // Clean trailing empty steps or double newlines
+  // 3. Strip any other raw URLs (https://... or http://...) so text stays 100% link-free and clean
+  cleaned = cleaned.replace(/https?:\/\/[^\s\)]+/gi, '');
+
+  // 4. Clean brackets or artifacts left over from URL removal
+  cleaned = cleaned.replace(/\(\s*@SmartX_PreRegister_bot\s*\)/gi, '@SmartX_PreRegister_bot');
+  cleaned = cleaned.replace(/\(\s*\)/g, '');
+  cleaned = cleaned.replace(/\[\s*\]/g, '');
+
+  // 5. Clean empty lines
   cleaned = cleaned.replace(/\n{3,}/g, '\n\n').trim();
 
   return cleaned;
@@ -391,7 +400,7 @@ async function callGeminiWithFallback(contents, apiKey, userName = '', isGroup =
     `- Telegram Username: @smart_x_help\n` +
     `- Pre-Registration Bot: @SmartX_PreRegister_bot\n` +
     `- Phone Number: 0992480372\n` +
-    `- YouTube Channel: https://www.youtube.com/@smartx.ethiopia\n` +
+    `- YouTube: Smart X Ethiopia\n` +
     `- App Release Date: መስከረም 5 (Smart x Ethiopian Mobile App .apk file)\n\n` +
     `🛑 OUTPUT FORMATTING CLEANLINESS:\n` +
     `- Output ONLY the final raw chat text meant for the user.\n` +
@@ -809,7 +818,9 @@ async function sendSimpleTelegramMessage(token, chatId, htmlText) {
       body: JSON.stringify({
         chat_id: chatId,
         text: htmlText,
-        parse_mode: 'HTML'
+        parse_mode: 'HTML',
+        link_preview_options: { is_disabled: true },
+        disable_web_page_preview: true
       })
     });
     if (res.ok) {
