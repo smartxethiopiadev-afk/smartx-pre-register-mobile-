@@ -73,14 +73,56 @@ async function handleTelegramUpdate(update, env) {
   if (!message) return;
 
   const chatId = message.chat?.id;
+  const chatType = message.chat?.type || 'private';
+  const isGroup = chatType === 'group' || chatType === 'supergroup';
   const businessConnectionId = message.business_connection_id || update.business_connection_id;
   if (!chatId) return;
 
+  const senderId = message.from?.id;
   const senderName = message.from?.first_name || message.chat?.first_name || '';
   const senderUsername = message.from?.username || message.chat?.username || '';
 
-  const userParts = [];
   let userCaption = message.text || message.caption || '';
+
+  // 🛡️ Group Anti-Link & Protection System
+  if (isGroup) {
+    const hasLink = checkMessageContainsLink(message, userCaption);
+    if (hasLink) {
+      const isAdminUser = await checkIfAdmin(env.TELEGRAM_BOT_TOKEN, chatId, senderId, senderUsername);
+      if (!isAdminUser) {
+        console.log(`🛡️ Anti-Link triggered in group ${chatId} by user ${senderId} (${senderUsername || senderName}). Deleting message...`);
+        // 1. Delete unauthorized link message immediately
+        await deleteTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, message.message_id);
+
+        // 2. Send short warning to group
+        const warningMsg = `⚠️ <b>${senderName || 'አባል'}</b>፣ በግሩፑ ውስጥ የሊንክ (Link) ልጥፍ የተከለከለ ስለሆነ መልእክትዎ ተሰርዟል!`;
+        const sentWarning = await sendSimpleTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, warningMsg);
+
+        // 3. Auto-delete warning after 8 seconds to keep group clean
+        if (sentWarning && sentWarning.message_id) {
+          setTimeout(async () => {
+            try {
+              await deleteTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, sentWarning.message_id);
+            } catch (_) {}
+          }, 8000);
+        }
+
+        return; // Stop processing link message
+      }
+    }
+  }
+
+  // In groups, only respond if someone mentions bot, replies to bot, or asks a direct inquiry
+  if (isGroup) {
+    const isBotMentioned = checkIsBotMentioned(message, userCaption);
+    const isReplyToBot = message.reply_to_message?.from?.is_bot;
+    if (!isBotMentioned && !isReplyToBot) {
+      // Allow normal member conversations without AI spamming
+      return;
+    }
+  }
+
+  const userParts = [];
 
   // Step 1: Send typing status indicator to Telegram
   await sendTelegramChatAction(env.TELEGRAM_BOT_TOKEN, chatId, 'typing', businessConnectionId);
@@ -151,15 +193,28 @@ async function handleTelegramUpdate(update, env) {
   ];
 
   // Step 6: Call Gemini API with Multi-Model Fallback & Chat History
-  const aiResponse = await callGeminiWithFallback(contents, env.GEMINI_API_KEY, senderName);
+  const aiResponse = await callGeminiWithFallback(contents, env.GEMINI_API_KEY, senderName, isGroup);
 
   // Step 7: Update Local Sliding Window Chat History
   history.push({ role: 'user', parts: userParts });
   history.push({ role: 'model', parts: [{ text: aiResponse }] });
   CHAT_HISTORIES.set(chatId, history.slice(-MAX_HISTORY_TURNS));
 
-  // Step 8: Send AI reply back to user via Telegram
-  await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, aiResponse, businessConnectionId);
+  // Step 8: Check if AI response contains a Poll / Quiz structure
+  const pollData = extractPollData(aiResponse);
+  if (pollData && pollData.poll) {
+    if (pollData.intro) {
+      await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, pollData.intro, businessConnectionId);
+    }
+    const pollSent = await sendTelegramPoll(env.TELEGRAM_BOT_TOKEN, chatId, pollData.poll);
+    if (!pollSent && !pollData.intro) {
+      // Fallback: if poll failed to send, send raw message
+      await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, aiResponse, businessConnectionId);
+    }
+  } else {
+    // Send standard text message back to user via Telegram
+    await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, aiResponse, businessConnectionId);
+  }
 }
 
 /**
@@ -193,35 +248,57 @@ async function getTelegramFileBase64(token, fileId) {
 /**
  * Call Gemini API using a Multi-Model Fallback system with Automatic Retry logic
  */
-async function callGeminiWithFallback(contents, apiKey, userName = '') {
+async function callGeminiWithFallback(contents, apiKey, userName = '', isGroup = false) {
   if (!apiKey) {
     throw new Error('GEMINI_API_KEY environment variable is missing.');
   }
 
   const nameGreeting = userName ? ` (User's Name: "${userName}")` : '';
 
+  const groupInstruction = isGroup
+    ? `\n\n📊 GROUP QUESTION / QUIZ / POLL RULE (ግሩፕ ላይ ጥያቄ ሲጠየቅ):\n` +
+      `- When users in a group ask a question, ask for a quiz, tag the bot with a STEM/school/general question, or say "ጥያቄ ጠይቀን" / "question":\n` +
+      `- ALWAYS generate the response as an interactive Telegram Quiz/Poll in JSON format so members can vote and easily forward it to other groups/channels:\n` +
+      `\`\`\`json\n` +
+      `{\n` +
+      `  "intro": "እንሆ የዛሬው ጥያቄ! 👇 መልሳችሁን ምረጡና ወደ ሌሎች ጓደኞቻችሁም forward አድርጉት!",\n` +
+      `  "poll": {\n` +
+      `    "question": "ጥያቄው እዚህ በአማርኛ ይፃፍ...",\n` +
+      `    "options": ["A. ምርጫ አንድ", "B. ምርጫ ሁለት", "C. ምርጫ ሶስት", "D. ምርጫ አራት"],\n` +
+      `    "correct_option_id": 0,\n` +
+      `    "explanation": "ትክክለኛው መልስ ማብራሪያ በአጭሩ..."\n` +
+      `  }\n` +
+      `}\n` +
+      `\`\`\`\n` +
+      `- Make sure "options" has 2 to 4 clear choices, "correct_option_id" is the index (0, 1, 2, or 3) of the correct answer, and "explanation" is under 200 characters.\n`
+    : '';
+
   const systemInstructionText =
     `You are the elite, warm, and highly professional personal assistant for Habtamu Yifiru (@smart_x_help / Smart x Ethiopian creator).\n\n` +
     `🛑 CRITICAL STRICT RULES:\n` +
     `1. PURE AMHARIC LANGUAGE ONLY (ሁሉም መልሶች በአማርኛ ብቻ ይሁኑ): Always respond in natural, warm, and clear Amharic (አማርኛ) for all users and questions.\n` +
     `2. PERSONALIZE GREETINGS WITH NAME: Always greet the user using their name${nameGreeting} (e.g. "ሰላም ${userName || ''}! 👋 እንኳን ደህና መጡ!").\n` +
-    `3. NO REPETITIVE INTRODUCTIONS: NEVER say "I am an AI", "እኔ AI ነኝ", or mention any company/agency. Do NOT introduce yourself or state your role unless the user explicitly asks "Who are you?".\n` +
+    `3. ABSOLUTE STRICT BAN ON AI IDENTIFIERS: NEVER say "I am an AI", "እኔ AI ነኝ", or mention any AI company. Always speak as a real, helpful human personal assistant for Habtamu Yifiru.\n` +
     `4. REPLY TO EVERY MESSAGE: Always provide an active, helpful, and contextual reply in Amharic to every incoming message or inquiry.\n` +
     `5. ABUSIVE / OFFENSIVE LANGUAGE RULE (የሚሳደብ ካለ አይመልስ by ይበል): If a user uses insults, bad words, vulgarity, or abusive language, do NOT help or argue. Reply strictly with "ደህና ሁኑ! 👋" and end the conversation immediately.\n` +
     `6. ABSOLUTE CONCISE RESPONSES: Keep every response short, clean, direct, and decorated with tasteful emojis 😊. Maximum 2-4 lines or clean bullet steps. No giant essays.\n` +
     `7. CHAT HISTORY CONTINUITY: Always read and respect the previous chat history naturally.\n\n` +
-    `📚 INBOX SCENARIO & REGISTRATION STEPS (Short Notes, Worksheets & App Release):\n` +
+    groupInstruction +
+    `📚 INBOX SCENARIO & REGISTRATION STEPS (Short Notes, Worksheets, Group & App Release):\n` +
     `- CONTEXT: Habtamu posts on groups: "short note and worksheet የምትፈልጉ በ inbox አውሩን".\n` +
     `- When users message in inbox (e.g., "እኔ እፈልጋለው", "hi", "worksheet", "short note", "መዝግቡኝ", "እንዴት ላግኝ", "ጥያቄ አለኝ", or any related request):\n` +
-    `  1. Greet them warmly with their name (e.g. "ሰላም ${userName || ''}! 👋 እንኳን ደህና መጡ!") and tell them to click the "🚀 ምዝገባ ጀምር (Start Bot)" button below.\n` +
-    `  2. Give them the clear step-by-step guidance:\n` +
-    `     • ደረጃ 1: ከታች ያለውን "🚀 ምዝገባ ጀምር (Start Bot)" የሚለውን Button ይጫኑ\n` +
+    `  1. Greet them warmly with their name (e.g. "ሰላም ${userName || ''}! 👋 እንኳን ደህና መጡ!")\n` +
+    `  2. Tell them to register on the bot by clicking "🚀 ምዝገባ ጀምር (Start Bot)" and join the official group: https://t.me/SmartX_Ethio\n` +
+    `  3. Give them the simple step-by-step guidance:\n` +
+    `     • ደረጃ 1: ከታች ያለውን "🚀 ምዝገባ ጀምር" Button ይጫኑ\n` +
     `     • ደረጃ 2: Language (ቋንቋ) ይምረጡ (አማርኛ ወይም English)\n` +
     `     • ደረጃ 3: የክፍል ደረጃዎን ይምረጡ (Grade 9 - 12)\n` +
     `     • ደረጃ 4: የፍላጎት ማረጋገጫ 5 አጫጭር ጥያቄዎችን ይመልሱ\n` +
-    `     • ደረጃ 5: ጥያቄዎቹን ሲጨርሱ Telegram Channel Join ያድርጉ\n` +
-    `  3. Inform them: Smart x Ethiopian Mobile Application በይፋ መስከረም 5 ይለቀቃል! እርምጃዎቹን አጠናቀው Notification on አድርገው ይጠብቁ።\n` +
-    `  4. SCREENSHOT RULE: Do NOT ask for screenshots by default. Only tell them: "የከበዳችሁ ወይም ያልገባችሁ ደረጃ ካለ የ Screen Shot ምስል ላኩልን፣ በደስታ እናግዛችኋለን! 😊"\n\n` +
+    `     • ደረጃ 5: Telegram Channel Join ያድርጉ እና የውይይት ግሩፑን (https://t.me/SmartX_Ethio) ይቀላቀሉ\n` +
+    `  4. Explain about Mobile App APK Release: አዲሱ Smart x Ethiopian Mobile Application (.apk file) በይፋ መስከረም 5 ይለቀቃል! Notification On አድርገው ይጠብቁ።\n` +
+    `  5. SCREENSHOT RULE: Do NOT ask for screenshots by default. Only tell them: "የከበዳችሁ ወይም ያልገባችሁ ደረጃ ካለ የ Screen Shot ምስል ላኩልን፣ በደስታ እናግዛችኋለን! 😊"\n\n` +
+    `📞 PHONE NUMBER & CONTACTS RULE:\n` +
+    `- If a user asks for phone number, direct call, or direct contact, provide: 0992480372 (ወይም በ @smart_x_help ያግኙን).\n\n` +
     `🎙️ VISION, TROUBLESHOOTING & MULTIMODAL:\n` +
     `1. TROUBLESHOOTING SCREENSHOTS: When a user sends a screenshot of any step where they got stuck or confused, analyze the exact screen/button/prompt, tell them what went wrong or what to click next in clear Amharic, and guide them to finish.\n` +
     `2. GENERAL IMAGES: If an image is a question, worksheet, code snippet, or document, provide a clean, accurate, and direct explanation in Amharic.\n` +
@@ -236,9 +313,10 @@ async function callGeminiWithFallback(contents, apiKey, userName = '') {
     `Only share when requested or relevant:\n` +
     `- Telegram Username: @smart_x_help\n` +
     `- Pre-Registration Bot Link: https://t.me/SmartX_PreRegister_bot?start=ref_7471102761\n` +
+    `- Telegram Group Link: https://t.me/SmartX_Ethio\n` +
     `- Phone Number: 0992480372\n` +
     `- YouTube Channel: https://www.youtube.com/@smartx.ethiopia\n` +
-    `- App Release Date: መስከረም 5 (Smart x Ethiopian Mobile App)\n\n` +
+    `- App Release Date: መስከረም 5 (Smart x Ethiopian Mobile App .apk file)\n\n` +
     `🛑 OUTPUT FORMATTING CLEANLINESS:\n` +
     `- Output ONLY the final raw chat text meant for the user.\n` +
     `- NEVER output debug logs, character counts, internal reasoning, or quotation marks.`;
@@ -376,6 +454,12 @@ function getRegistrationInlineMarkup(text) {
             text: '🚀 ምዝገባ ጀምር (Start Bot) 👉',
             url: 'https://t.me/SmartX_PreRegister_bot?start=ref_7471102761'
           }
+        ],
+        [
+          {
+            text: '👥 የቴሌግራም ግሩፕ ተቀላቀሉ (Join Group) 💬',
+            url: 'https://t.me/SmartX_Ethio'
+          }
         ]
       ]
     };
@@ -442,6 +526,228 @@ async function sendTelegramMessage(token, chatId, text, businessConnectionId = n
       throw new Error(`Telegram sendMessage HTTP ${res.status}: ${errBody}`);
     }
   }
+}
+
+/**
+ * Extract Poll / Quiz JSON from Gemini response if present
+ */
+function extractPollData(text) {
+  if (!text) return null;
+
+  try {
+    // Check if whole text or fenced code block is JSON
+    const jsonMatch = text.match(/```(?:json)?\s*([\s\S]*?)\s*```/) || [null, text];
+    const rawJson = jsonMatch[1] || text;
+    const parsed = JSON.parse(rawJson);
+    if (parsed && parsed.poll && parsed.poll.question && Array.isArray(parsed.poll.options)) {
+      return parsed;
+    }
+  } catch (_) {
+    // If not strict JSON, look for embedded {"poll": ...}
+    const startIdx = text.indexOf('{"poll"');
+    const altStartIdx = text.indexOf('{\n  "poll"');
+    const idx = startIdx !== -1 ? startIdx : altStartIdx;
+    if (idx !== -1) {
+      try {
+        const endIdx = text.lastIndexOf('}');
+        if (endIdx > idx) {
+          const jsonSub = text.substring(idx, endIdx + 1);
+          const parsed = JSON.parse(jsonSub);
+          if (parsed && parsed.poll) {
+            const intro = text.substring(0, idx).trim();
+            return { intro, poll: parsed.poll };
+          }
+        }
+      } catch (__) {}
+    }
+  }
+  return null;
+}
+
+/**
+ * Send interactive Telegram Native Quiz / Poll to Chat or Group
+ */
+async function sendTelegramPoll(token, chatId, pollData) {
+  if (!token || !chatId || !pollData) return null;
+
+  const rawOptions = Array.isArray(pollData.options) ? pollData.options : [];
+  const options = rawOptions
+    .map((opt) => (typeof opt === 'string' ? opt : String(opt || '')).trim())
+    .filter(Boolean);
+
+  if (options.length < 2) return null;
+
+  const question = String(pollData.question || 'የዛሬው ጥያቄ').trim().slice(0, 300);
+  const correctOptionId =
+    typeof pollData.correct_option_id === 'number' &&
+    pollData.correct_option_id >= 0 &&
+    pollData.correct_option_id < options.length
+      ? pollData.correct_option_id
+      : 0;
+
+  const explanation = pollData.explanation
+    ? String(pollData.explanation).trim().slice(0, 200)
+    : undefined;
+
+  const body = {
+    chat_id: chatId,
+    question: question,
+    options: options.slice(0, 10),
+    type: 'quiz',
+    correct_option_id: correctOptionId,
+    is_anonymous: false
+  };
+
+  if (explanation) {
+    body.explanation = explanation;
+  }
+
+  try {
+    let res = await fetch(`https://api.telegram.org/bot${token}/sendPoll`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    });
+
+    if (!res.ok) {
+      // Fallback: If Quiz mode fails due to explanation/formatting constraints, send as regular poll
+      delete body.correct_option_id;
+      delete body.explanation;
+      body.type = 'regular';
+
+      res = await fetch(`https://api.telegram.org/bot${token}/sendPoll`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body)
+      });
+    }
+
+    if (res.ok) {
+      const data = await res.json();
+      return data.result;
+    } else {
+      const errText = await res.text();
+      console.warn('sendPoll error response:', errText);
+    }
+  } catch (err) {
+    console.error('Error dispatching Telegram sendPoll:', err);
+  }
+
+  return null;
+}
+
+/**
+ * Check if a message contains links, URLs, invites, or domain promotions
+ */
+function checkMessageContainsLink(message, text = '') {
+  // Check Telegram entities
+  const entities = [...(message.entities || []), ...(message.caption_entities || [])];
+  for (const entity of entities) {
+    if (entity.type === 'url' || entity.type === 'text_link') {
+      return true;
+    }
+  }
+
+  // Regex check for links, telegram handles, or domains
+  const linkRegex = /(https?:\/\/|t\.me\/|telegram\.me\/|telegram\.dog\/|joinchat\/|bit\.ly\/|www\.)[^\s]+/i;
+  if (linkRegex.test(text)) {
+    return true;
+  }
+
+  return false;
+}
+
+/**
+ * Check if user is an Administrator, Creator, or Owner (Habtamu)
+ */
+async function checkIfAdmin(token, chatId, userId, username = '') {
+  // Check known admin identifiers
+  const cleanUsername = (username || '').replace('@', '').toLowerCase();
+  if (cleanUsername === 'smart_x_help' || String(userId) === '7471102761') {
+    return true;
+  }
+
+  if (!userId || !token) return false;
+
+  try {
+    const res = await fetch(`https://api.telegram.org/bot${token}/getChatMember`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_id: chatId,
+        user_id: userId
+      })
+    });
+
+    if (res.ok) {
+      const data = await res.json();
+      const status = data.result?.status;
+      return status === 'creator' || status === 'administrator';
+    }
+  } catch (err) {
+    console.error('Error checking chat member admin status:', err);
+  }
+
+  return false;
+}
+
+/**
+ * Check if bot is mentioned in a group message
+ */
+function checkIsBotMentioned(message, text = '') {
+  const entities = message.entities || [];
+  for (const entity of entities) {
+    if (entity.type === 'mention') {
+      return true;
+    }
+  }
+  return text.toLowerCase().includes('@smart') || text.includes('/start') || text.includes('/help');
+}
+
+/**
+ * Delete a message from a Telegram chat/group
+ */
+async function deleteTelegramMessage(token, chatId, messageId) {
+  if (!token || !chatId || !messageId) return false;
+  try {
+    const res = await fetch(`https://api.telegram.org/bot${token}/deleteMessage`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_id: chatId,
+        message_id: messageId
+      })
+    });
+    return res.ok;
+  } catch (err) {
+    console.error('Failed to delete Telegram message:', err);
+    return false;
+  }
+}
+
+/**
+ * Send a simple plain/HTML message without inline keyboards
+ */
+async function sendSimpleTelegramMessage(token, chatId, htmlText) {
+  if (!token || !chatId) return null;
+  try {
+    const res = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_id: chatId,
+        text: htmlText,
+        parse_mode: 'HTML'
+      })
+    });
+    if (res.ok) {
+      const data = await res.json();
+      return data.result;
+    }
+  } catch (err) {
+    console.error('Failed to send simple message:', err);
+  }
+  return null;
 }
 
 /**
