@@ -36,7 +36,13 @@ export default {
     if (request.method === 'POST') {
       try {
         const update = await request.json();
-        await handleTelegramUpdate(update, env, ctx);
+        // Execute asynchronously using ctx.waitUntil so Telegram receives 200 OK immediately
+        // while the 1-minute scheduled delay executes smoothly in the background
+        if (ctx && typeof ctx.waitUntil === 'function') {
+          ctx.waitUntil(handleTelegramUpdate(update, env, ctx));
+        } else {
+          await handleTelegramUpdate(update, env, ctx);
+        }
       } catch (err) {
         console.error('Unhandled Telegram Processing Error:', err);
         // Dispatch alert to Admin private chat on failure
@@ -220,14 +226,20 @@ async function handleTelegramUpdate(update, env, ctx) {
   ];
 
   // Step 6: Call Gemini API with Multi-Model Fallback & Chat History
-  const aiResponse = await callGeminiWithFallback(contents, env.GEMINI_API_KEY, senderName, isGroup);
+  const rawAiResponse = await callGeminiWithFallback(contents, env.GEMINI_API_KEY, senderName, isGroup);
+  const aiResponse = sanitizeBotResponse(rawAiResponse);
 
   // Step 7: Update Local Sliding Window Chat History
   history.push({ role: 'user', parts: userParts });
   history.push({ role: 'model', parts: [{ text: aiResponse }] });
   CHAT_HISTORIES.set(chatId, history.slice(-MAX_HISTORY_TURNS));
 
-  // Step 8: Check if AI response contains a Poll / Quiz structure
+  // Step 8: Natural Scheduled Delay (~50-60 seconds / ~1 minute) before replying to direct chats
+  if (!isGroup) {
+    await delayWithTyping(env.TELEGRAM_BOT_TOKEN, chatId, 50000, businessConnectionId);
+  }
+
+  // Step 9: Check if AI response contains a Poll / Quiz structure
   const pollData = extractPollData(aiResponse);
   if (pollData && pollData.poll) {
     if (pollData.intro) {
@@ -242,6 +254,42 @@ async function handleTelegramUpdate(update, env, ctx) {
     // Send standard text message back to user via Telegram
     await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, aiResponse, businessConnectionId);
   }
+}
+
+/**
+ * Natural human-like scheduled delay (~1 minute) with active typing status
+ */
+async function delayWithTyping(token, chatId, totalMs = 50000, businessConnectionId = null) {
+  const start = Date.now();
+  while (Date.now() - start < totalMs) {
+    await sendTelegramChatAction(token, chatId, 'typing', businessConnectionId);
+    const remaining = totalMs - (Date.now() - start);
+    const sleepTime = Math.min(remaining, 5000);
+    if (sleepTime <= 0) break;
+    await new Promise((resolve) => setTimeout(resolve, sleepTime));
+  }
+}
+
+/**
+ * Clean & sanitize response to strictly remove any group links and raw URLs from text
+ */
+function sanitizeBotResponse(text) {
+  if (!text) return '';
+  let cleaned = text;
+
+  // Remove any mentions of group link or t.me/SmartX_Ethio
+  cleaned = cleaned.replace(/https?:\/\/t\.me\/SmartX_Ethio[^\s]*/gi, '');
+  cleaned = cleaned.replace(/@SmartX_Ethio/gi, '');
+  cleaned = cleaned.replace(/•?\s*ደረጃ\s*5[^\n]*የውይይት[^\n]*/gi, '');
+  cleaned = cleaned.replace(/•?\s*ደረጃ\s*5[^\n]*ግሩፕ[^\n]*/gi, '');
+
+  // Clean raw bot URLs in text body into neat clean mention @SmartX_PreRegister_bot
+  cleaned = cleaned.replace(/https?:\/\/t\.me\/SmartX_PreRegister_bot[^\s\)]*/gi, '@SmartX_PreRegister_bot');
+
+  // Clean trailing empty steps or double newlines
+  cleaned = cleaned.replace(/\n{3,}/g, '\n\n').trim();
+
+  return cleaned;
 }
 
 /**
@@ -324,7 +372,7 @@ async function callGeminiWithFallback(contents, apiKey, userName = '', isGroup =
     `  4. Explain about Mobile App APK Release: አዲሱ Smart x Ethiopian Mobile Application (.apk file) በይፋ መስከረም 5 ይለቀቃል! Notification On አድርገው ይጠብቁ።\n` +
     `  5. SCREENSHOT RULE: Do NOT ask for screenshots by default. Only tell them: "የከበዳችሁ ወይም ያልገባችሁ ደረጃ ካለ የ Screen Shot ምስል ላኩልን፣ በደስታ እናግዛችኋለን! 😊"\n` +
     `  6. IMPORTANT FORMATTING RULE: In your message text, NEVER write raw URLs like "https://t.me/...". ALWAYS write the clean username "@SmartX_PreRegister_bot" instead, so the message stays neat and human-like.\n` +
-    `  7. GROUP LINK RULE: Do NOT give the telegram group link unless the user explicitly asks for "group", "ግሩፕ", or "group link". If asked, provide: @SmartX_Ethio.\n\n` +
+    `  7. STRICT BAN ON GROUP LINKS: NEVER mention, share, or write any Telegram group link. Do NOT mention @SmartX_Ethio or any group. Registration is only via @SmartX_PreRegister_bot.\n\n` +
     `📞 PHONE NUMBER & CONTACTS RULE:\n` +
     `- If a user asks for phone number, direct call, or direct contact, provide: 0992480372 (ወይም በ @smart_x_help ያግኙን).\n\n` +
     `🎙️ VISION, TROUBLESHOOTING & MULTIMODAL:\n` +
