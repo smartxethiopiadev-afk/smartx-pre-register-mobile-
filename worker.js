@@ -319,25 +319,18 @@ async function handleTelegramUpdate(update, env, ctx) {
 }
 
 /**
- * Natural human-like scheduled delay:
- * 1. Silent Reading Period (~18 seconds) - NO typing action sent
- * 2. Active Typing Period (~12 seconds) - Sends typing action
- * Complies with Telegram Anti-Spam / Rate-limiting policies and prevents account bans
+ * Natural human-like scheduled delay (Cloudflare Worker safe):
+ * 1. Silent Reading Period (~1.2 seconds)
+ * 2. Active Typing Period (~1.8 seconds)
+ * Complies with Telegram Anti-Spam policies and Cloudflare Workers CPU/time limits.
  */
 async function delayWithHumanPacing(token, chatId, businessConnectionId = null) {
-  // Phase 1: Silent reading delay (18 seconds)
-  await new Promise((resolve) => setTimeout(resolve, 18000));
+  // Phase 1: Silent reading delay (1.2s)
+  await new Promise((resolve) => setTimeout(resolve, 1200));
 
-  // Phase 2: Active typing delay (12 seconds)
-  const typingStart = Date.now();
-  const typingDuration = 12000;
-  while (Date.now() - typingStart < typingDuration) {
-    await sendTelegramChatAction(token, chatId, 'typing', businessConnectionId);
-    const remaining = typingDuration - (Date.now() - typingStart);
-    const sleepTime = Math.min(remaining, 4000);
-    if (sleepTime <= 0) break;
-    await new Promise((resolve) => setTimeout(resolve, sleepTime));
-  }
+  // Phase 2: Active typing delay (1.8s)
+  await sendTelegramChatAction(token, chatId, 'typing', businessConnectionId);
+  await new Promise((resolve) => setTimeout(resolve, 1800));
 }
 
 /**
@@ -535,22 +528,26 @@ async function callGeminiWithFallback(contents, apiKey, userName = '', isGroup =
  * Send Chat Action (e.g. typing) to Telegram
  */
 async function sendTelegramChatAction(token, chatId, action = 'typing', businessConnectionId = null) {
-  if (!token) throw new Error('TELEGRAM_BOT_TOKEN environment variable is missing.');
+  if (!token || !chatId) return;
 
-  const body = {
-    chat_id: chatId,
-    action: action
-  };
+  try {
+    const body = {
+      chat_id: chatId,
+      action: action
+    };
 
-  if (businessConnectionId) {
-    body.business_connection_id = businessConnectionId;
+    if (businessConnectionId) {
+      body.business_connection_id = businessConnectionId;
+    }
+
+    await fetch(`https://api.telegram.org/bot${token}/sendChatAction`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    });
+  } catch (err) {
+    console.warn('sendTelegramChatAction non-fatal warning:', err?.message || err);
   }
-
-  await fetch(`https://api.telegram.org/bot${token}/sendChatAction`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body)
-  });
 }
 
 /**
