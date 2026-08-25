@@ -23,6 +23,7 @@ const GEMINI_MODELS = [
 const CHAT_HISTORIES = new Map();
 const BUTTON_SENT_CHATS = new Set();
 const THANKS_COUNT = new Map();
+const REGISTERED_USERS = new Map(); // Store registered users: userId -> { chatId, name, username, referredBy, timestamp }
 const MAX_HISTORY_TURNS = 10; // Keep up to last 10 turns (5 user + 5 model)
 
 export default {
@@ -160,6 +161,39 @@ async function handleTelegramUpdate(update, env, ctx) {
   }
 
   let userCaption = message.text || message.caption || '';
+
+  // 🚀 Instant Referral & Database Registration System
+  if (senderId && !message.from?.is_bot) {
+    let referredBy = null;
+    if (userCaption.startsWith('/start')) {
+      const parts = userCaption.split(' ');
+      if (parts.length > 1) {
+        const payload = parts[1].trim();
+        if (payload.startsWith('ref_')) {
+          referredBy = payload.replace('ref_', '').trim();
+        } else {
+          referredBy = payload;
+        }
+      }
+    }
+
+    const existingUser = REGISTERED_USERS.get(senderId);
+    if (!existingUser) {
+      REGISTERED_USERS.set(senderId, {
+        userId: senderId,
+        chatId: chatId,
+        name: senderName,
+        username: senderUsername,
+        referredBy: referredBy || (existingUser ? existingUser.referredBy : null),
+        registeredAt: new Date().toISOString()
+      });
+      console.log(`[Database Registration] New registered user saved: ID=${senderId}, Name=${senderName}, ChatId=${chatId}, ReferredBy=${referredBy || 'None'}`);
+    } else if (referredBy && !existingUser.referredBy) {
+      existingUser.referredBy = referredBy;
+      REGISTERED_USERS.set(senderId, existingUser);
+      console.log(`[Database Registration] Updated referral for existing user ID=${senderId}: ReferredBy=${referredBy}`);
+    }
+  }
 
   // 🛑 Conversation Closing Acknowledgement (Code 08) & Abusive Language (Code 05) Pre-Filters:
   let history = CHAT_HISTORIES.get(chatId) || [];
