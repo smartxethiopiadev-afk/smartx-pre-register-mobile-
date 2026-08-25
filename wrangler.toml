@@ -1,0 +1,9 @@
+name = "telegram-business-gemini-responder"
+main = "worker.js"
+compatibility_date = "2025-05-01"
+compatibility_flags = ["nodejs_compat"]
+
+# Environment secrets required in Cloudflare Worker dashboard:
+# - TELEGRAM_BOT_TOKEN
+# - GEMINI_API_KEY
+# - ADMIN_CHAT_ID

@@ -1,0 +1,7 @@
+# GitHub export includes only deployment files
+*
+!worker.js
+!package.json
+!wrangler.toml
+!.gitignore
+!.env.example
