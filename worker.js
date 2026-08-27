@@ -121,12 +121,31 @@ async function handleTelegramUpdate(update, env, ctx) {
   const chatId = message.chat?.id;
   const chatType = message.chat?.type || 'private';
   const isGroup = chatType === 'group' || chatType === 'supergroup';
-  const businessConnectionId = message.business_connection_id || update.business_connection_id;
+  const isBusinessMessage = Boolean(update.business_message);
+  const businessConnectionId = isBusinessMessage ? (message.business_connection_id || null) : null;
   if (!chatId) return;
 
   const senderId = message.from?.id;
   const senderName = message.from?.first_name || message.chat?.first_name || '';
-  const senderUsername = message.from?.username || message.chat?.username || '';
+  const senderUsername = (message.from?.username || message.chat?.username || '').toLowerCase();
+
+  // 🛑 0. CRITICAL ANTI-LOOP & OWNER OUTGOING FILTER:
+  // If the message is sent by the bot itself or by Habtamu/Admin (outgoing messages), NEVER auto-reply!
+  if (message.from?.is_bot) {
+    return;
+  }
+  const adminIdStr = env.ADMIN_CHAT_ID ? String(env.ADMIN_CHAT_ID).trim() : '7471102761';
+  if (senderId && (String(senderId) === adminIdStr || senderUsername === 'smart_x_help')) {
+    console.log(`[Owner Filter] Outgoing message sent by Admin/Owner (${senderId} / @${senderUsername}). Skipping auto-reply.`);
+    return;
+  }
+
+  // 🎥 Video / Video Note / Animation Filter: If user sends pure video without text inquiry, do NOT reply
+  const isPureVideo = (message.video || message.video_note || message.animation) && !message.caption && !message.text;
+  if (isPureVideo) {
+    console.log(`[Media Filter] User sent pure video/animation without text caption. Silently ignoring.`);
+    return;
+  }
 
   // 🌟 1. Handle New Chat Member Joining Group (Welcome Message & Auto-Delete)
   if (isGroup && message.new_chat_members && message.new_chat_members.length > 0) {
@@ -278,7 +297,9 @@ async function handleTelegramUpdate(update, env, ctx) {
   // Step 4: Handle Stickers
   if (message.sticker) {
     const emoji = message.sticker.emoji || '😊';
-    if (!userCaption) userCaption = `[User sent a sticker ${emoji}]`;
+    if (!userCaption) {
+      userCaption = `[ተጠቃሚው ስቲከር ላከ / Sticker: ${emoji}]`;
+    }
   }
 
   // Push user text/caption if present or fallback
@@ -311,8 +332,8 @@ async function handleTelegramUpdate(update, env, ctx) {
     }
   ];
 
-  // Step 6: Call Gemini API with Multi-Model Fallback & Chat History
-  const rawAiResponse = await callGeminiWithFallback(contents, env.GEMINI_API_KEY, senderName, isGroup);
+  // Step 6: Call Gemini API with Multi-Key Rotation, Multi-Model Fallback & Chat History
+  const rawAiResponse = await callGeminiWithFallback(contents, env, senderName, isGroup);
   const trimmedCode = (rawAiResponse || '').trim();
 
   // 🛑 Silence Codes:
@@ -428,17 +449,37 @@ async function getTelegramFileBase64(token, fileId) {
 }
 
 /**
- * Call Gemini API using a Multi-Model Fallback system with Automatic Retry logic
+ * Helper to extract all available Gemini API Keys from environment secrets
+ * Supports multiple comma-separated keys in GEMINI_API_KEYS or GEMINI_API_KEY
  */
-async function callGeminiWithFallback(contents, apiKey, userName = '', isGroup = false) {
-  if (!apiKey) {
-    throw new Error('GEMINI_API_KEY environment variable is missing.');
+function getGeminiApiKeys(env) {
+  const raw = env.GEMINI_API_KEYS || env.GEMINI_API_KEY || '';
+  if (!raw) return [];
+  if (typeof raw === 'string' && raw.startsWith('[') && raw.endsWith(']')) {
+    try {
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) return parsed.map(k => String(k).trim()).filter(Boolean);
+    } catch (_) {}
+  }
+  return String(raw)
+    .split(/[,\n]+/)
+    .map(k => k.trim())
+    .filter(Boolean);
+}
+
+/**
+ * Call Gemini API using Multi-Key Rotation and Multi-Model Fallback system with Automatic Retry logic
+ */
+async function callGeminiWithFallback(contents, env, userName = '', isGroup = false) {
+  const apiKeys = getGeminiApiKeys(env);
+  if (apiKeys.length === 0) {
+    throw new Error('GEMINI_API_KEY or GEMINI_API_KEYS environment variable is missing.');
   }
 
   const nameGreeting = userName ? ` (User's Name: "${userName}")` : '';
 
   const systemInstructionText =
-    `You are the official, warm, and highly professional student support assistant for Smart X Ethiopia (@smart_x_help / Smart X Ethiopian Mobile Academy).\n\n` +
+    `You are the official, friendly, knowledgeable, and highly helpful educational support assistant for Smart X Ethiopia (@smart_x_help / Smart X Ethiopian Mobile Academy).\n\n` +
     `🛑 CRITICAL STRICT PROTOCOL RULES:\n` +
     `1. CONVERSATION CLOSING & THANKS RULE (ኮድ 08 - ሁለተኛ ምስጋና ላይ ፍፁም ዝምታ):\n` +
     `   - If the user sends a second thank you / closing acknowledgement, or says "TNX", "thanks", "eshi", "ok", "bye" after you already said "ምንም አይደለም! በደስታ ነው 😊":\n` +
@@ -448,26 +489,32 @@ async function callGeminiWithFallback(contents, apiKey, userName = '', isGroup =
     `   If the user uses insults, bad words, vulgarity, curses, or abusive language:\n` +
     `   👉 YOUR ENTIRE OUTPUT MUST BE STRICTLY: 05\n` +
     `   (Do not output any words, punctuation, or emojis, just "05").\n\n` +
-    `3. PURE AMHARIC LANGUAGE ONLY (ሁሉም መልሶች በአማርኛ ብቻ ይሁኑ): Always respond in natural, warm, and clear Amharic (አማርኛ) for all regular inquiries.\n` +
-    `4. PERSONALIZE GREETINGS WITH NAME: Greet the user using their name${nameGreeting} (e.g. "ሰላም ${userName || ''}! 👋 እንኳን ወደ Smart X Ethiopia በደህና መጡ!").\n` +
-    `5. STRICT IDENTITY RULE (ስለ Smart X Ethiopia ብቻ ማውራት):\n` +
-    `   - ALWAYS speak solely as "የ Smart X Ethiopia ድጋፍ ሰጪ" (Smart X Ethiopian Support).\n` +
-    `   - DO NOT mention personal names like "ሀብታሙ" / "የሀብታሙ ረዳት ነኝ" or anything similar. You represent Smart X Ethiopia only.\n` +
-    `   - NEVER say "I am an AI", "እኔ AI ነኝ", or mention any AI company.\n\n` +
-    `6. ABSOLUTE BAN ON GROUP DATA & GROUP LINKS:\n` +
+    `3. AI IDENTITY DISCLOSURE RULE (AI መሆንህን የምትናገረው በቀጥታ ሲጠይቁህ ብቻ ነው):\n` +
+    `   - Normally, speak naturally and warmly as "የ Smart X Ethiopia የትምህርት ድጋፍ ሰጪ".\n` +
+    `   - IF AND ONLY IF the user explicitly asks whether you are an AI, bot, human, or robot (e.g., "AI ነህ?", "ሰው ነህ ወይስ ቦት?", "Are you an AI?", "ሮቦት ነህ?"): Answer politely and clearly in Amharic:\n` +
+    `     "አዎ፣ እኔ ለተማሪዎች የትምህርት ድጋፍ እና ማብራሪያ ለመስጠት በ Smart X Ethiopia (@smart_x_help / Habtamu Yifiru) የተዘጋጀሁ ዘመናዊ AI ረዳት ነኝ! 😊 እንዴት ልርዳዎት?"\n` +
+    `   - If NOT asked about your identity, just answer their questions directly without declaring you are AI.\n\n` +
+    `4. PURE AMHARIC LANGUAGE ONLY (ሁሉም መልሶች በአማርኛ ብቻ ይሁኑ): Always respond in natural, warm, and clear Amharic (አማርኛ) for regular inquiries.\n` +
+    `5. PERSONALIZE GREETINGS WITH NAME: Greet the user using their name${nameGreeting} (e.g. "ሰላም ${userName || ''}! 👋 እንኳን ወደ Smart X Ethiopia በደህና መጡ!").\n\n` +
+    `6. EDUCATIONAL SUPPORT & STUDY TIPS (የትምህርት እና የጥናት ምክሮች):\n` +
+    `   - You provide comprehensive support for school subjects (Mathematics, Physics, Chemistry, Biology, English, History, Civics, Geography, Economics, IT, etc.), homework help, concept explanations, and study strategies.\n` +
+    `   - When students ask how to study (እንዴት ላጥና፣ ፈተና ተቃረበብኝ፣ ትምህርት ከብዶኛል፣ ውጤቴን እንዴት ላሻሽል፣ የማጥናት ዘዴ): Provide practical, science-backed study techniques in clear Amharic:\n` +
+    `     • **Active Recall (ራስን መፈተሽ)**: አንብቦ ከመቀመጥ ይልቅ ማስታወሻውን ዘግቶ ጥያቄዎችን ራስን መጠየቅ።\n` +
+    `     • **Spaced Repetition (ክለሳ)**: ዛሬ ያነበቡትን ከ3 ቀን በኋላ፣ ከሳምንት በኋላ መከለስ።\n` +
+    `     • **Pomodoro Technique (የ25 ደቂቃ እቅድ)**: 25 ደቂቃ በጥልቅ ማጥናት፣ 5 ደቂቃ ማረፍ።\n` +
+    `     • **Feynman Technique (ማስተማር)**: የተማሩትን በቀላል ቋንቋ ለጓደኛ ወይም ለራስ ማስረዳት።\n` +
+    `     • **Short Notes & Past Exams**: አጫጭር ማጠቃለያዎችን ማዘጋጀት እና የሞዴል/ብሔራዊ ፈተና ጥያቄዎችን መስራት።\n` +
+    `     • **Time Management & Exam Motivation**: ለፈተና ዝግጅት እና ጭንቀትን ለመቀነስ የሚረዱ አነቃቂ ምክሮች።\n\n` +
+    `7. ABSOLUTE BAN ON GROUP DATA & GROUP LINKS:\n` +
     `   - NEVER share, mention, or write ANY Telegram group link or group username (e.g., do NOT mention SmartX_Ethio, "ግሩፕ ተቀላቀሉ", or any group).\n` +
     `   - All student guidance is ONLY focused on @SmartX_PreRegister_bot.\n\n` +
-    `7. CONCISE & CLEAN RESPONSES: Keep every response short, clean, direct, and decorated with tasteful emojis 😊. Maximum 2-4 lines or clean bullet steps. No giant essays.\n` +
-    `8. SUBSEQUENT CHAT TURNS & FOLLOW-UPS (ከመጀመሪያው መልስ በኋላ የሚደረግ ውይይት):\n` +
+    `8. CONCISE & CLEAN RESPONSES: Keep every response clean, direct, and decorated with tasteful emojis 😊. Maximum 2-5 lines or clean bullet points. No giant walls of text.\n\n` +
+    `9. SUBSEQUENT CHAT TURNS & FOLLOW-UPS (ከመጀመሪያው መልስ በኋላ የሚደረግ ውይይት):\n` +
     `   - If this is a follow-up message (you already gave the introduction in chat history), DO NOT repeat the full 4-step registration block or long greeting again.\n` +
-    `   - Answer the user's specific question or confusion in 1 to 2 very short, direct lines.\n` +
-    `   - If they need guidance on a specific step, show ONLY that single step clearly and briefly.\n` +
-    `9. STRICT BAN ON RAW / REFERRAL LINKS IN NORMAL MESSAGES:\n` +
+    `   - Answer the user's specific question or confusion in 1 to 3 very short, direct lines.\n\n` +
+    `10. STRICT BAN ON RAW / REFERRAL LINKS IN NORMAL MESSAGES:\n` +
     `   - NEVER write full URLs, referral links (?start=ref_...), or raw https links in the message body.\n` +
-    `   - ALWAYS refer to the bot as "@SmartX_PreRegister_bot" in normal message text so the conversation looks natural and complies with Telegram's spam policy.\n` +
-    `10. TELEGRAM POLICY & ACCOUNT SAFETY (የቴሌግራም ፖሊሲ ጥበቃ):\n` +
-    `   - Always sound like an attentive human support team member.\n` +
-    `   - Never flood or send repetitive spam messages to avoid account flagging or restrictions.\n\n` +
+    `   - ALWAYS refer to the bot as "@SmartX_PreRegister_bot" in normal message text so the conversation looks natural and complies with Telegram's spam policy.\n\n` +
     `📚 INBOX SCENARIO & REGISTRATION STEPS (Short Notes, Worksheets & App Release):\n` +
     `- CONTEXT: Student reaches out regarding Short notes, worksheets, and Mobile App pre-registration.\n` +
     `- When users message in inbox (e.g., "እኔ እፈልጋለው", "hi", "worksheet", "short note", "መዝግቡኝ", "እንዴት ላግኝ", "ጥያቄ አለኝ", or any related request):\n` +
@@ -483,13 +530,11 @@ async function callGeminiWithFallback(contents, apiKey, userName = '', isGroup =
     `  6. FORMATTING: NEVER write raw URLs like "https://t.me/...". ALWAYS write the clean username "@SmartX_PreRegister_bot".\n\n` +
     `📞 CONTACTS RULE:\n` +
     `- If a user asks for phone number, direct call, or direct contact, provide: 0992480372 (ወይም በ @smart_x_help ያግኙን).\n\n` +
-    `🎙️ VISION, TROUBLESHOOTING & MULTIMODAL:\n` +
+    `🎙️ VISION, STICKERS, TROUBLESHOOTING & MULTIMODAL:\n` +
     `1. TROUBLESHOOTING SCREENSHOTS: When a user sends a screenshot of any step where they got stuck or confused, analyze the exact screen/button/prompt, tell them what went wrong or what to click next in clear Amharic, and guide them to finish.\n` +
     `2. GENERAL IMAGES: If an image is a question, worksheet, code snippet, or document, provide a clean, accurate, and direct explanation in Amharic.\n` +
-    `3. VOICE / AUDIO NOTES: Seamlessly answer voice notes directly in Amharic without commenting that it was audio.\n\n` +
-    `🧠 TONE & PERSONALITY (HUMAN-LIKE):\n` +
-    `- Speak warmly, politely, calmly, and naturally like a real professional human assistant in Amharic.\n` +
-    `- Avoid robotic walls of text or repetitive boilerplate. Be direct, clear, and helpful.\n\n` +
+    `3. VOICE / AUDIO NOTES: Seamlessly answer voice notes directly in Amharic without commenting that it was audio.\n` +
+    `4. STICKERS: If user sends a friendly sticker (👋, 😊, 👍, etc.), respond with a warm matching greeting.\n\n` +
     `🛑 OUTPUT FORMATTING CLEANLINESS:\n` +
     `- Output ONLY the final raw chat text meant for the user (or "08" / "05" when applicable).\n` +
     `- NEVER output debug logs, character counts, internal reasoning, or quotation marks.`;
@@ -505,57 +550,68 @@ async function callGeminiWithFallback(contents, apiKey, userName = '', isGroup =
     }
   };
 
-  const modelErrors = [];
+  const keyErrors = [];
 
-  // Iterate through the fallback list of Gemini models
-  for (const modelName of GEMINI_MODELS) {
-    const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${apiKey}`;
+  // 🔄 Key-Rotation Loop: Iterate through each available Gemini API Key
+  for (let keyIdx = 0; keyIdx < apiKeys.length; keyIdx++) {
+    const currentApiKey = apiKeys[keyIdx];
 
-    // Retry loop for transient errors (e.g., 503 Service Unavailable or 429 Rate Limit)
-    const MAX_RETRIES = 2;
-    for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
-      try {
-        if (attempt > 0) {
-          console.log(`[Gemini Retry] Retrying ${modelName} (Attempt ${attempt + 1}/${MAX_RETRIES + 1})...`);
-          await new Promise((resolve) => setTimeout(resolve, 1500));
-        }
+    // Iterate through the fallback list of Gemini models for the current API key
+    for (const modelName of GEMINI_MODELS) {
+      const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${currentApiKey}`;
 
-        const response = await fetch(endpoint, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(payload)
-        });
+      // Retry loop for transient network glitches
+      const MAX_RETRIES = 1;
+      for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+        try {
+          if (attempt > 0) {
+            console.log(`[Gemini Retry] Retrying ${modelName} with Key #${keyIdx + 1} (Attempt ${attempt + 1}/${MAX_RETRIES + 1})...`);
+            await new Promise((resolve) => setTimeout(resolve, 1000));
+          }
 
-        if ((response.status === 503 || response.status === 429) && attempt < MAX_RETRIES) {
-          console.warn(`[Gemini ${modelName}] HTTP ${response.status}. Retrying...`);
-          continue;
-        }
+          const response = await fetch(endpoint, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload)
+          });
 
-        if (!response.ok) {
-          const errBody = await response.text();
-          throw new Error(`HTTP ${response.status}: ${errBody}`);
-        }
+          // If Rate Limited (429) or Quota Exceeded or Forbidden (403), rotate to next API key immediately
+          if (response.status === 429 || response.status === 403) {
+            console.warn(`[Gemini Key Rotate] Key #${keyIdx + 1} received HTTP ${response.status} (${modelName}). Rotating to next API key...`);
+            keyErrors.push(`Key #${keyIdx + 1} (${modelName}): HTTP ${response.status}`);
+            break; // Break model loop to try the next key!
+          }
 
-        const data = await response.json();
-        const replyText = data.candidates?.[0]?.content?.parts?.[0]?.text;
+          if (response.status === 503 && attempt < MAX_RETRIES) {
+            console.warn(`[Gemini ${modelName}] HTTP 503 Service Unavailable. Retrying...`);
+            continue;
+          }
 
-        if (!replyText) {
-          throw new Error('Returned empty or invalid candidate content.');
-        }
+          if (!response.ok) {
+            const errBody = await response.text();
+            throw new Error(`HTTP ${response.status}: ${errBody}`);
+          }
 
-        console.log(`[Gemini Success] Successfully generated response using model: ${modelName}`);
-        return replyText;
-      } catch (err) {
-        console.warn(`[Gemini Attempt Failed] Model ${modelName} (Attempt ${attempt + 1}): ${err.message}`);
+          const data = await response.json();
+          const replyText = data.candidates?.[0]?.content?.parts?.[0]?.text;
 
-        if (attempt === MAX_RETRIES) {
-          modelErrors.push(`${modelName}: ${err.message}`);
+          if (!replyText) {
+            throw new Error('Returned empty or invalid candidate content.');
+          }
+
+          console.log(`[Gemini Success] Key #${keyIdx + 1} successfully generated response using model: ${modelName}`);
+          return replyText;
+        } catch (err) {
+          console.warn(`[Gemini Attempt Failed] Key #${keyIdx + 1} Model ${modelName} (Attempt ${attempt + 1}): ${err.message}`);
+          if (attempt === MAX_RETRIES) {
+            keyErrors.push(`Key #${keyIdx + 1} (${modelName}): ${err.message}`);
+          }
         }
       }
     }
   }
 
-  throw new Error(`All Gemini Fallback Models Failed:\n${modelErrors.join('\n')}`);
+  throw new Error(`All Gemini API Keys & Models Failed:\n${keyErrors.join('\n')}`);
 }
 
 /**
@@ -670,19 +726,37 @@ async function sendTelegramMessage(token, chatId, text, businessConnectionId = n
     body: JSON.stringify(body)
   });
 
-  // Fallback 1: If HTML parse fails, resend as plain text
   if (!res.ok) {
-    console.warn('Telegram HTML parse failed. Falling back to plain text sending...');
-    delete body.parse_mode;
-    body.text = text; // original plain text
+    let errBody = await res.text();
+    console.warn(`[Telegram sendMessage warning] Status ${res.status}: ${errBody}`);
 
-    res = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body)
-    });
+    // Fallback 1: If BUSINESS_PEER_INVALID or invalid business connection, retry without business_connection_id
+    if (body.business_connection_id && (errBody.includes('BUSINESS_PEER_INVALID') || errBody.includes('BUSINESS_CONNECTION'))) {
+      console.warn('Telegram business connection invalid for peer. Retrying as direct bot message...');
+      delete body.business_connection_id;
+      res = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body)
+      });
+      if (res.ok) return;
+      errBody = await res.text();
+    }
 
-    // Fallback 2: If inline_keyboard fails in any specific client/mode, retry without reply_markup
+    // Fallback 2: If HTML parse fails, resend as plain text
+    if (!res.ok) {
+      console.warn('Telegram HTML parse failed. Falling back to plain text sending...');
+      delete body.parse_mode;
+      body.text = text; // original plain text
+
+      res = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body)
+      });
+    }
+
+    // Fallback 3: If inline_keyboard fails in any specific client/mode, retry without reply_markup
     if (!res.ok && body.reply_markup) {
       console.warn('Telegram reply_markup failed. Retrying without reply_markup...');
       delete body.reply_markup;
@@ -694,9 +768,21 @@ async function sendTelegramMessage(token, chatId, text, businessConnectionId = n
       });
     }
 
+    // Fallback 4: If business_connection_id is still present and failed, final retry without it
+    if (!res.ok && body.business_connection_id) {
+      console.warn('Final retry without business_connection_id...');
+      delete body.business_connection_id;
+
+      res = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body)
+      });
+    }
+
     if (!res.ok) {
-      const errBody = await res.text();
-      throw new Error(`Telegram sendMessage HTTP ${res.status}: ${errBody}`);
+      const finalErr = await res.text();
+      throw new Error(`Telegram sendMessage HTTP ${res.status}: ${finalErr}`);
     }
   }
 }
