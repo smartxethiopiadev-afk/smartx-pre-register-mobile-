@@ -162,27 +162,17 @@ async function handleTelegramUpdate(update, env, ctx) {
     return;
   }
 
-  // 🔒 Concurrency Lock Per Chat: Prevent overlapping parallel executions during high traffic bursts
-  if (CHAT_LOCKS.has(chatId)) {
-    console.log(`[Concurrency Lock] Chat ${chatId} is currently processing another message. Queuing/waiting briefly...`);
-    await new Promise(resolve => setTimeout(resolve, 800));
-  }
-  CHAT_LOCKS.set(chatId, Date.now());
-
-  try {
-    await processMessageUpdate(message, update, env, ctx, {
-      chatId,
-      chatType,
-      isGroup,
-      isBusinessMessage,
-      businessConnectionId,
-      senderId,
-      senderName,
-      senderUsername
-    });
-  } finally {
-    CHAT_LOCKS.delete(chatId);
-  }
+  // Instant execution: Process message immediately with zero artificial delay
+  await processMessageUpdate(message, update, env, ctx, {
+    chatId,
+    chatType,
+    isGroup,
+    isBusinessMessage,
+    businessConnectionId,
+    senderId,
+    senderName,
+    senderUsername
+  });
 }
 
 /**
@@ -258,23 +248,25 @@ async function processMessageUpdate(message, update, env, ctx, meta) {
     }
   }
 
-  // 🛑 Conversation Closing Acknowledgement (Code 08) & Abusive Language (Code 05) Pre-Filters:
-  let history = CHAT_HISTORIES.get(chatId) || [];
-  if (!isGroup && isClosingAcknowledgement(userCaption, history)) {
-    const previousThanks = THANKS_COUNT.get(chatId) || 0;
-    if (previousThanks >= 1) {
-      console.log(`[Code 08] User sent 2nd closing phrase "${userCaption}". Concluding in complete silence.`);
-      return;
-    }
-    // First thanks: respond warmly once, then increment count
-    THANKS_COUNT.set(chatId, 1);
-    console.log(`[Code 08] User sent 1st closing phrase "${userCaption}". Replying politely once.`);
-    await delayWithHumanPacing(env.TELEGRAM_BOT_TOKEN, chatId, businessConnectionId);
-    await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, 'ምንም አይደለም! በደስታ ነው 😊 መልካም የትምህርት ጊዜ! ✨', businessConnectionId, false);
+  // 🛑 Abusive Language Filter (Code 05):
+  if (!isGroup && isAbusiveMessage(userCaption)) {
+    console.log(`[Code 05] User message contained abusive words. Concluding in silence.`);
     return;
   }
-  if (!isGroup && isAbusiveMessage(userCaption)) {
-    console.log(`[Code 05] User message contained abusive words. Concluding conversation in silence.`);
+
+  // Reset closing thanks counter whenever user asks a substantive message or question
+  if (!isClosingAcknowledgement(userCaption)) {
+    THANKS_COUNT.delete(chatId);
+  } else if (!isGroup) {
+    // If it's a pure closing phrase (like only "tnx", "አመሰግናለሁ"):
+    const previousThanks = THANKS_COUNT.get(chatId) || 0;
+    if (previousThanks >= 1) {
+      console.log(`[Code 08] User sent repeated closing phrase "${userCaption}". Ending turn silently.`);
+      return;
+    }
+    THANKS_COUNT.set(chatId, 1);
+    // Reply instantly without any delay
+    await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, 'ምንም አይደለም! በደስታ ነው 😊 መልካም የትምህርት ጊዜ! ✨', businessConnectionId, false);
     return;
   }
 
@@ -302,12 +294,10 @@ async function processMessageUpdate(message, update, env, ctx, meta) {
     }
   }
 
-  const userParts = [];
+  // Trigger non-blocking typing action immediately so the user sees instant feedback
+  sendTelegramChatAction(env.TELEGRAM_BOT_TOKEN, chatId, 'typing', businessConnectionId).catch(() => {});
 
-  // Step 1: In groups, send short typing indicator
-  if (isGroup) {
-    await sendTelegramChatAction(env.TELEGRAM_BOT_TOKEN, chatId, 'typing', businessConnectionId);
-  }
+  const userParts = [];
 
   // Step 2: Handle incoming Images/Photos (Vision)
   if (message.photo && message.photo.length > 0) {
@@ -355,13 +345,12 @@ async function processMessageUpdate(message, update, env, ctx, meta) {
   }
 
   // Step 5: Construct Chat History Context
-  // history is already retrieved at the top of the function
+  let history = CHAT_HISTORIES.get(chatId) || [];
 
   // Check if user is replying to a previous message
   if (message.reply_to_message) {
     const replyText = message.reply_to_message.text || message.reply_to_message.caption;
     if (replyText) {
-      // Add context turn if history is empty
       if (history.length === 0) {
         history.push({ role: 'user', parts: [{ text: `[Context: Replying to previous message: "${replyText}"]` }] });
       }
@@ -381,8 +370,6 @@ async function processMessageUpdate(message, update, env, ctx, meta) {
   const trimmedCode = (rawAiResponse || '').trim();
 
   // 🛑 Silence Codes:
-  // Code 08: User closed or thanked (TNX, thanks, eshi, etc.) -> Total silence
-  // Code 05: Abusive / offensive message -> Total silence
   if (trimmedCode === '08' || trimmedCode.startsWith('08') || trimmedCode === '05' || trimmedCode.startsWith('05')) {
     console.log(`[AI Silent Code ${trimmedCode}] Keeping conversation concluded in complete silence.`);
     history.push({ role: 'user', parts: userParts });
@@ -398,38 +385,15 @@ async function processMessageUpdate(message, update, env, ctx, meta) {
   history.push({ role: 'model', parts: [{ text: aiResponse }] });
   CHAT_HISTORIES.set(chatId, history.slice(-MAX_HISTORY_TURNS));
 
-  // 🔘 Button Rule: The registration button is sent ONLY ONCE on the first introductory message
-  // If the conversation already has prior bot messages or button was already sent, do NOT attach button.
+  // 🔘 Button Rule: The registration button is attached on introductory messages
   const hadPreviousModelReply = history.slice(0, -2).some(turn => turn.role === 'model' && turn.parts?.[0]?.text !== '08' && turn.parts?.[0]?.text !== '05');
   const shouldAttachButton = !isGroup && !hadPreviousModelReply && !BUTTON_SENT_CHATS.has(chatId);
   if (shouldAttachButton) {
     BUTTON_SENT_CHATS.add(chatId);
   }
 
-  // Step 8: Natural Scheduled Delay (~30-45 seconds) before replying to direct chats
-  // Phase 1: 15-20s reading pause (No typing shown, simulates user reading incoming message)
-  // Phase 2: 10-15s typing phase (Shows "typing..." status naturally)
-  if (!isGroup) {
-    await delayWithHumanPacing(env.TELEGRAM_BOT_TOKEN, chatId, businessConnectionId);
-  }
-
-  // Step 9: Send text message back to user via Telegram (Telegram rate limit safe)
+  // Step 8: Send instant text message back to user via Telegram with ZERO DELAY
   await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, aiResponse, businessConnectionId, shouldAttachButton);
-}
-
-/**
- * Natural human-like scheduled delay (Cloudflare Worker safe):
- * 1. Silent Reading Period (~1.2 seconds)
- * 2. Active Typing Period (~1.8 seconds)
- * Complies with Telegram Anti-Spam policies and Cloudflare Workers CPU/time limits.
- */
-async function delayWithHumanPacing(token, chatId, businessConnectionId = null) {
-  // Phase 1: Silent reading delay (1.2s)
-  await new Promise((resolve) => setTimeout(resolve, 1200));
-
-  // Phase 2: Active typing delay (1.8s)
-  await sendTelegramChatAction(token, chatId, 'typing', businessConnectionId);
-  await new Promise((resolve) => setTimeout(resolve, 1800));
 }
 
 /**
@@ -560,13 +524,12 @@ async function callGeminiWithFallback(contents, env, userName = '', isGroup = fa
     `8. ABSOLUTE BAN ON GROUP DATA & GROUP LINKS:\n` +
     `   - NEVER share, mention, or write ANY Telegram group link or group username (e.g., do NOT mention SmartX_Ethio, "ግሩፕ ተቀላቀሉ", or any group).\n` +
     `   - All student guidance is ONLY focused on @SmartX_PreRegister_bot.\n\n` +
-    `9. CONCISE & COMPLETE RESPONSES (ሳይቆራረጥ ንጹህ ሆኖ እንዲደርስ):\n` +
-    `   - Keep responses direct, well-structured, and decorated with tasteful emojis 😊.\n` +
-    `   - Provide fully completed thoughts, answers, and explanations without cutting off mid-sentence.\n\n` +
-    `10. SUBSEQUENT CHAT TURNS & FOLLOW-UPS (ከመጀመሪያው መልስ በኋላ የሚደረግ ውይይት):\n` +
-    `   - If this is a follow-up message (you already gave the introduction in chat history), DO NOT repeat the full 4-step registration block or long greeting again.\n` +
-    `   - Answer the user's specific question or confusion directly in 1 to 3 short lines.\n\n` +
-    `11. STRICT BAN ON RAW / REFERRAL LINKS IN NORMAL MESSAGES:\n` +
+    `9. STRICT CONCISENESS ON ALL SUBSEQUENT TURNS (ከመጀመሪያው ውይይት ውጪ ሌላውን ሁሉ እጅግ አሳጥሮ መመለስ):\n` +
+    `   - **FIRST INTERACTION**: Give the warm normal welcome and the 4-step registration guide for @SmartX_PreRegister_bot.\n` +
+    `   - **ALL SUBSEQUENT TURNS & FOLLOW-UPS**: Be EXTREMELY SHORT, direct, and concise (1 to 2 lines max!).\n` +
+    `   - DO NOT repeat the 4-step registration block, greetings, or long explanations if you already introduced them.\n` +
+    `   - If user asks a specific question (e.g., "መቼ ነው የሚለቀቀው?", "እንዴት ነው?", "ሂሳብ ጥያቄ አለኝ"), answer that specific point directly in 1-2 punchy, helpful lines with nice emojis 😊.\n\n` +
+    `10. STRICT BAN ON RAW / REFERRAL LINKS IN NORMAL MESSAGES:\n` +
     `   - NEVER write full URLs, referral links (?start=ref_...), or raw https links in the message body.\n` +
     `   - ALWAYS refer to the bot as "@SmartX_PreRegister_bot" in normal message text so the conversation looks natural and complies with Telegram's spam policy.\n\n` +
     `📚 INBOX SCENARIO & REGISTRATION STEPS (Short Notes, Worksheets & App Release):\n` +
