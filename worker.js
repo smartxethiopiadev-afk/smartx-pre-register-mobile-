@@ -24,7 +24,12 @@ const CHAT_HISTORIES = new Map();
 const BUTTON_SENT_CHATS = new Set();
 const THANKS_COUNT = new Map();
 const REGISTERED_USERS = new Map(); // Store registered users: userId -> { chatId, name, username, referredBy, timestamp }
-const MAX_HISTORY_TURNS = 10; // Keep up to last 10 turns (5 user + 5 model)
+const CHAT_LOCKS = new Map(); // Concurrency locks per chatId to prevent race conditions during high message traffic
+const MAX_HISTORY_TURNS = 30; // Keep up to last 30 turns (15 user + 15 model) for long-term memory continuity
+
+// Admin / Owner Telegram IDs & Usernames (Excluded from auto-reply loops)
+const ADMIN_IDS = new Set(['7471102761', '8344169004']);
+const ADMIN_USERNAMES = new Set(['smart_x_help']);
 
 export default {
   async fetch(request, env, ctx) {
@@ -134,8 +139,18 @@ async function handleTelegramUpdate(update, env, ctx) {
   if (message.from?.is_bot) {
     return;
   }
-  const adminIdStr = env.ADMIN_CHAT_ID ? String(env.ADMIN_CHAT_ID).trim() : '7471102761';
-  if (senderId && (String(senderId) === adminIdStr || senderUsername === 'smart_x_help')) {
+
+  // Parse all configured Admin IDs (supports env.ADMIN_CHAT_ID comma-separated list + default IDs 7471102761 & 8344169004)
+  const allAdminIds = new Set([...ADMIN_IDS]);
+  if (env.ADMIN_CHAT_ID) {
+    String(env.ADMIN_CHAT_ID)
+      .split(/[,\s]+/)
+      .map(id => id.trim())
+      .filter(Boolean)
+      .forEach(id => allAdminIds.add(id));
+  }
+
+  if (senderId && (allAdminIds.has(String(senderId)) || ADMIN_USERNAMES.has(senderUsername))) {
     console.log(`[Owner Filter] Outgoing message sent by Admin/Owner (${senderId} / @${senderUsername}). Skipping auto-reply.`);
     return;
   }
@@ -146,6 +161,35 @@ async function handleTelegramUpdate(update, env, ctx) {
     console.log(`[Media Filter] User sent pure video/animation without text caption. Silently ignoring.`);
     return;
   }
+
+  // 🔒 Concurrency Lock Per Chat: Prevent overlapping parallel executions during high traffic bursts
+  if (CHAT_LOCKS.has(chatId)) {
+    console.log(`[Concurrency Lock] Chat ${chatId} is currently processing another message. Queuing/waiting briefly...`);
+    await new Promise(resolve => setTimeout(resolve, 800));
+  }
+  CHAT_LOCKS.set(chatId, Date.now());
+
+  try {
+    await processMessageUpdate(message, update, env, ctx, {
+      chatId,
+      chatType,
+      isGroup,
+      isBusinessMessage,
+      businessConnectionId,
+      senderId,
+      senderName,
+      senderUsername
+    });
+  } finally {
+    CHAT_LOCKS.delete(chatId);
+  }
+}
+
+/**
+ * Core processor for validated message update
+ */
+async function processMessageUpdate(message, update, env, ctx, meta) {
+  const { chatId, isGroup, businessConnectionId, senderId, senderName, senderUsername } = meta;
 
   // 🌟 1. Handle New Chat Member Joining Group (Welcome Message & Auto-Delete)
   if (isGroup && message.new_chat_members && message.new_chat_members.length > 0) {
@@ -491,34 +535,44 @@ async function callGeminiWithFallback(contents, env, userName = '', isGroup = fa
     `   (Do not output any words, punctuation, or emojis, just "05").\n\n` +
     `3. AI IDENTITY DISCLOSURE RULE (AI መሆንህን የምትናገረው በቀጥታ ሲጠይቁህ ብቻ ነው):\n` +
     `   - Normally, speak naturally and warmly as "የ Smart X Ethiopia የትምህርት ድጋፍ ሰጪ".\n` +
-    `   - IF AND ONLY IF the user explicitly asks whether you are an AI, bot, human, or robot (e.g., "AI ነህ?", "ሰው ነህ ወይስ ቦት?", "Are you an AI?", "ሮቦት ነህ?"): Answer politely and clearly in Amharic:\n` +
-    `     "አዎ፣ እኔ ለተማሪዎች የትምህርት ድጋፍ እና ማብራሪያ ለመስጠት በ Smart X Ethiopia (@smart_x_help / Habtamu Yifiru) የተዘጋጀሁ ዘመናዊ AI ረዳት ነኝ! 😊 እንዴት ልርዳዎት?"\n` +
+    `   - IF AND ONLY IF the user explicitly asks whether you are an AI, bot, human, or robot (e.g., "AI ነህ?", "ሰው ነህ ወይስ ቦት?", "Are you an AI?", "ሮቦት ነህ?"): Answer politely and clearly:\n` +
+    `     - In Amharic: "አዎ፣ እኔ ለተማሪዎች የትምህርት ድጋፍ እና ማብራሪያ ለመስጠት በ Smart X Ethiopia (@smart_x_help / Habtamu Yifiru) የተዘጋጀሁ ዘመናዊ AI ረዳት ነኝ! 😊 እንዴት ልርዳዎት?"\n` +
+    `     - In Afaan Oromoo: "Eeyyee, ani gargaaraa barnootaa AI ammayyaa barattootaaf qophaa'ee dha! 😊 Akkamitti isin gargaaruu danda'a?"\n` +
+    `     - In English: "Yes, I am the AI educational support assistant created for Smart X Ethiopia students! 😊 How can I help you today?"\n` +
     `   - If NOT asked about your identity, just answer their questions directly without declaring you are AI.\n\n` +
-    `4. PURE AMHARIC LANGUAGE ONLY (ሁሉም መልሶች በአማርኛ ብቻ ይሁኑ): Always respond in natural, warm, and clear Amharic (አማርኛ) for regular inquiries.\n` +
+    `4. MULTILINGUAL & LANGUAGE SELECTION INTELLIGENCE (የቋንቋ አጠቃቀም ደንብ):\n` +
+    `   - **DEFAULT / INITIAL GREETING (በመጀመሪያ በአማርኛ ይጀምሩ)**: Always start and default to natural, warm Amharic (አማርኛ) for new users and standard inquiries.\n` +
+    `   - **AFAAN OROMOO (ኦሮምኛ)**: If the user speaks in Afaan Oromoo (e.g. "Akkam", "Barachuu barbaada", "Short note fi worksheet naaf ergaa", "Oromiffaan natti himi", "Galatoomi") or specifically requests Afaan Oromoo: Immediately and fluently switch to high-quality, friendly Afaan Oromoo for all explanations and registration steps!\n` +
+    `   - **ENGLISH (እንግሊዝኛ - በተደጋጋሚ ሲሆን ብቻ)**: If a user sends multiple messages in English, asks complex academic questions in English, or explicitly requests English: Respond in fluent, clear English. (For a casual initial single greeting like "hi" or "hello", greet in Amharic first with a polite bilingual touch; only switch to pure English if they persist in English).\n\n` +
     `5. PERSONALIZE GREETINGS WITH NAME: Greet the user using their name${nameGreeting} (e.g. "ሰላም ${userName || ''}! 👋 እንኳን ወደ Smart X Ethiopia በደህና መጡ!").\n\n` +
-    `6. EDUCATIONAL SUPPORT & STUDY TIPS (የትምህርት እና የጥናት ምክሮች):\n` +
+    `6. CHAT HISTORY & CONTINUITY MEMORY (ሁሉንም የውይይት ታሪክ ማስታወስ):\n` +
+    `   - Actively review and remember everything in the prior chat history (the student's grade, their previous questions, topics discussed, registration stage, and preferences).\n` +
+    `   - Maintain full continuity: never ask for details the user already told you earlier in the chat.\n\n` +
+    `7. EDUCATIONAL SUPPORT & STUDY TIPS (የትምህርት እና የጥናት ምክሮች):\n` +
     `   - You provide comprehensive support for school subjects (Mathematics, Physics, Chemistry, Biology, English, History, Civics, Geography, Economics, IT, etc.), homework help, concept explanations, and study strategies.\n` +
-    `   - When students ask how to study (እንዴት ላጥና፣ ፈተና ተቃረበብኝ፣ ትምህርት ከብዶኛል፣ ውጤቴን እንዴት ላሻሽል፣ የማጥናት ዘዴ): Provide practical, science-backed study techniques in clear Amharic:\n` +
+    `   - When students ask how to study (እንዴት ላጥና፣ ፈተና ተቃረበብኝ፣ ትምህርት ከብዶኛል፣ ውጤቴን እንዴት ላሻሽል፣ የማጥናት ዘዴ): Provide practical, science-backed study techniques:\n` +
     `     • **Active Recall (ራስን መፈተሽ)**: አንብቦ ከመቀመጥ ይልቅ ማስታወሻውን ዘግቶ ጥያቄዎችን ራስን መጠየቅ።\n` +
     `     • **Spaced Repetition (ክለሳ)**: ዛሬ ያነበቡትን ከ3 ቀን በኋላ፣ ከሳምንት በኋላ መከለስ።\n` +
     `     • **Pomodoro Technique (የ25 ደቂቃ እቅድ)**: 25 ደቂቃ በጥልቅ ማጥናት፣ 5 ደቂቃ ማረፍ።\n` +
     `     • **Feynman Technique (ማስተማር)**: የተማሩትን በቀላል ቋንቋ ለጓደኛ ወይም ለራስ ማስረዳት።\n` +
     `     • **Short Notes & Past Exams**: አጫጭር ማጠቃለያዎችን ማዘጋጀት እና የሞዴል/ብሔራዊ ፈተና ጥያቄዎችን መስራት።\n` +
     `     • **Time Management & Exam Motivation**: ለፈተና ዝግጅት እና ጭንቀትን ለመቀነስ የሚረዱ አነቃቂ ምክሮች።\n\n` +
-    `7. ABSOLUTE BAN ON GROUP DATA & GROUP LINKS:\n` +
+    `8. ABSOLUTE BAN ON GROUP DATA & GROUP LINKS:\n` +
     `   - NEVER share, mention, or write ANY Telegram group link or group username (e.g., do NOT mention SmartX_Ethio, "ግሩፕ ተቀላቀሉ", or any group).\n` +
     `   - All student guidance is ONLY focused on @SmartX_PreRegister_bot.\n\n` +
-    `8. CONCISE & CLEAN RESPONSES: Keep every response clean, direct, and decorated with tasteful emojis 😊. Maximum 2-5 lines or clean bullet points. No giant walls of text.\n\n` +
-    `9. SUBSEQUENT CHAT TURNS & FOLLOW-UPS (ከመጀመሪያው መልስ በኋላ የሚደረግ ውይይት):\n` +
+    `9. CONCISE & COMPLETE RESPONSES (ሳይቆራረጥ ንጹህ ሆኖ እንዲደርስ):\n` +
+    `   - Keep responses direct, well-structured, and decorated with tasteful emojis 😊.\n` +
+    `   - Provide fully completed thoughts, answers, and explanations without cutting off mid-sentence.\n\n` +
+    `10. SUBSEQUENT CHAT TURNS & FOLLOW-UPS (ከመጀመሪያው መልስ በኋላ የሚደረግ ውይይት):\n` +
     `   - If this is a follow-up message (you already gave the introduction in chat history), DO NOT repeat the full 4-step registration block or long greeting again.\n` +
-    `   - Answer the user's specific question or confusion in 1 to 3 very short, direct lines.\n\n` +
-    `10. STRICT BAN ON RAW / REFERRAL LINKS IN NORMAL MESSAGES:\n` +
+    `   - Answer the user's specific question or confusion directly in 1 to 3 short lines.\n\n` +
+    `11. STRICT BAN ON RAW / REFERRAL LINKS IN NORMAL MESSAGES:\n` +
     `   - NEVER write full URLs, referral links (?start=ref_...), or raw https links in the message body.\n` +
     `   - ALWAYS refer to the bot as "@SmartX_PreRegister_bot" in normal message text so the conversation looks natural and complies with Telegram's spam policy.\n\n` +
     `📚 INBOX SCENARIO & REGISTRATION STEPS (Short Notes, Worksheets & App Release):\n` +
     `- CONTEXT: Student reaches out regarding Short notes, worksheets, and Mobile App pre-registration.\n` +
     `- When users message in inbox (e.g., "እኔ እፈልጋለው", "hi", "worksheet", "short note", "መዝግቡኝ", "እንዴት ላግኝ", "ጥያቄ አለኝ", or any related request):\n` +
-    `  1. Greet them warmly: "ሰላም ${userName || ''}! 👋 እንኳን ወደ Smart X Ethiopia በደህና መጡ!"\n` +
+    `  1. Greet them warmly: "ሰላም ${userName || ''}! 👋 እንኳን ወደ Smart X Ethiopia በደህና መጡ!" (or in Afaan Oromoo if requested: "Akkam ${userName || ''}! 👋 Baga nagaan gara Smart X Ethiopia dhuftan!")\n` +
     `  2. Tell them clearly: Short note እና Worksheet ለማግኘት እንዲሁም ለአዲሱ Mobile App ለመመዝገብ @SmartX_PreRegister_bot ላይ ይግቡ።\n` +
     `  3. Give them the clear, clean step-by-step guidance:\n` +
     `     1️⃣ @SmartX_PreRegister_bot ገብተው "Start" ይበሉ\n` +
@@ -531,9 +585,9 @@ async function callGeminiWithFallback(contents, env, userName = '', isGroup = fa
     `📞 CONTACTS RULE:\n` +
     `- If a user asks for phone number, direct call, or direct contact, provide: 0992480372 (ወይም በ @smart_x_help ያግኙን).\n\n` +
     `🎙️ VISION, STICKERS, TROUBLESHOOTING & MULTIMODAL:\n` +
-    `1. TROUBLESHOOTING SCREENSHOTS: When a user sends a screenshot of any step where they got stuck or confused, analyze the exact screen/button/prompt, tell them what went wrong or what to click next in clear Amharic, and guide them to finish.\n` +
-    `2. GENERAL IMAGES: If an image is a question, worksheet, code snippet, or document, provide a clean, accurate, and direct explanation in Amharic.\n` +
-    `3. VOICE / AUDIO NOTES: Seamlessly answer voice notes directly in Amharic without commenting that it was audio.\n` +
+    `1. TROUBLESHOOTING SCREENSHOTS: When a user sends a screenshot of any step where they got stuck or confused, analyze the exact screen/button/prompt, tell them what went wrong or what to click next in clear Amharic/Afaan Oromoo, and guide them to finish.\n` +
+    `2. GENERAL IMAGES: If an image is a question, worksheet, code snippet, or document, provide a clean, accurate, and direct explanation.\n` +
+    `3. VOICE / AUDIO NOTES: Seamlessly answer voice notes directly without commenting that it was audio.\n` +
     `4. STICKERS: If user sends a friendly sticker (👋, 😊, 👍, etc.), respond with a warm matching greeting.\n\n` +
     `🛑 OUTPUT FORMATTING CLEANLINESS:\n` +
     `- Output ONLY the final raw chat text meant for the user (or "08" / "05" when applicable).\n` +
@@ -546,7 +600,7 @@ async function callGeminiWithFallback(contents, env, userName = '', isGroup = fa
     },
     generationConfig: {
       temperature: 0.5,
-      maxOutputTokens: 1000
+      maxOutputTokens: 2500
     }
   };
 
@@ -695,13 +749,76 @@ function getRegistrationInlineMarkup(text) {
 }
 
 /**
- * Send Message to Telegram Chat with HTML support, Start Bot button, and robust fallback
+ * Smart Text Chunker to prevent message truncation and stay within Telegram's 4096 char limit
+ */
+function splitTextIntoSafeChunks(text, maxChars = 3800) {
+  if (!text || text.length <= maxChars) return [text];
+
+  const chunks = [];
+  let remaining = text;
+
+  while (remaining.length > 0) {
+    if (remaining.length <= maxChars) {
+      chunks.push(remaining);
+      break;
+    }
+
+    // Try finding paragraph break (\n\n)
+    let splitIdx = remaining.lastIndexOf('\n\n', maxChars);
+    if (splitIdx < maxChars * 0.35) {
+      // Try single line break (\n)
+      splitIdx = remaining.lastIndexOf('\n', maxChars);
+    }
+    if (splitIdx < maxChars * 0.35) {
+      // Try sentence break (. or ! or ?)
+      splitIdx = remaining.lastIndexOf('. ', maxChars);
+      if (splitIdx !== -1) splitIdx += 1;
+    }
+    if (splitIdx < maxChars * 0.35) {
+      // Try space break
+      splitIdx = remaining.lastIndexOf(' ', maxChars);
+    }
+    if (splitIdx <= 0) {
+      // Fallback hard split
+      splitIdx = maxChars;
+    }
+
+    chunks.push(remaining.slice(0, splitIdx).trim());
+    remaining = remaining.slice(splitIdx).trim();
+  }
+
+  return chunks.filter(c => c && c.length > 0);
+}
+
+/**
+ * Send Message to Telegram Chat with automatic smart chunking, HTML support, Start Bot button, and robust fallback
  */
 async function sendTelegramMessage(token, chatId, text, businessConnectionId = null, attachButton = false) {
   if (!token) throw new Error('TELEGRAM_BOT_TOKEN environment variable is missing.');
+  if (!text) return;
 
-  const htmlText = convertMarkdownToTelegramHtml(text);
-  const inlineMarkup = attachButton ? getRegistrationInlineMarkup(text) : null;
+  const chunks = splitTextIntoSafeChunks(text, 3800);
+  for (let i = 0; i < chunks.length; i++) {
+    const chunkText = chunks[i];
+    const isFirst = i === 0;
+    const isLast = i === chunks.length - 1;
+    // Attach button to the first chunk if requested
+    const chunkAttachButton = attachButton && isFirst;
+
+    await sendSingleTelegramChunkWithRetry(token, chatId, chunkText, businessConnectionId, chunkAttachButton);
+    if (!isLast) {
+      // Small breathing delay between consecutive chunks
+      await new Promise(resolve => setTimeout(resolve, 300));
+    }
+  }
+}
+
+/**
+ * Helper to send a single chunk with full HTML parsing, 429 Flood Control backoff retry, and multiple fallbacks
+ */
+async function sendSingleTelegramChunkWithRetry(token, chatId, chunkText, businessConnectionId = null, attachButton = false) {
+  const htmlText = convertMarkdownToTelegramHtml(chunkText);
+  const inlineMarkup = attachButton ? getRegistrationInlineMarkup(chunkText) : null;
 
   const body = {
     chat_id: chatId,
@@ -719,16 +836,34 @@ async function sendTelegramMessage(token, chatId, text, businessConnectionId = n
     body.business_connection_id = businessConnectionId;
   }
 
-  // Primary Attempt: Send with HTML formatting, inline button, and link previews disabled
-  let res = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body)
-  });
+  const MAX_FLOOD_RETRIES = 2;
+  for (let attempt = 0; attempt <= MAX_FLOOD_RETRIES; attempt++) {
+    let res = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    });
 
-  if (!res.ok) {
+    if (res.ok) return;
+
+    const status = res.status;
     let errBody = await res.text();
-    console.warn(`[Telegram sendMessage warning] Status ${res.status}: ${errBody}`);
+
+    // 🌊 429 Flood Control / Rate Limit Handler: Wait required retry_after seconds and retry
+    if (status === 429 && attempt < MAX_FLOOD_RETRIES) {
+      let waitSeconds = 2;
+      try {
+        const parsed = JSON.parse(errBody);
+        if (parsed?.parameters?.retry_after) {
+          waitSeconds = Number(parsed.parameters.retry_after) + 1;
+        }
+      } catch (_) {}
+      console.warn(`[Telegram Flood 429] Rate limited. Pausing for ${waitSeconds}s before retrying chat ${chatId}...`);
+      await new Promise(resolve => setTimeout(resolve, waitSeconds * 1000));
+      continue;
+    }
+
+    console.warn(`[Telegram sendMessage warning] Status ${status}: ${errBody}`);
 
     // Fallback 1: If BUSINESS_PEER_INVALID or invalid business connection, retry without business_connection_id
     if (body.business_connection_id && (errBody.includes('BUSINESS_PEER_INVALID') || errBody.includes('BUSINESS_CONNECTION'))) {
@@ -747,13 +882,15 @@ async function sendTelegramMessage(token, chatId, text, businessConnectionId = n
     if (!res.ok) {
       console.warn('Telegram HTML parse failed. Falling back to plain text sending...');
       delete body.parse_mode;
-      body.text = text; // original plain text
+      body.text = chunkText; // original plain text
 
       res = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body)
       });
+      if (res.ok) return;
+      errBody = await res.text();
     }
 
     // Fallback 3: If inline_keyboard fails in any specific client/mode, retry without reply_markup
@@ -766,6 +903,8 @@ async function sendTelegramMessage(token, chatId, text, businessConnectionId = n
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body)
       });
+      if (res.ok) return;
+      errBody = await res.text();
     }
 
     // Fallback 4: If business_connection_id is still present and failed, final retry without it
@@ -778,11 +917,12 @@ async function sendTelegramMessage(token, chatId, text, businessConnectionId = n
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body)
       });
+      if (res.ok) return;
+      errBody = await res.text();
     }
 
-    if (!res.ok) {
-      const finalErr = await res.text();
-      throw new Error(`Telegram sendMessage HTTP ${res.status}: ${finalErr}`);
+    if (!res.ok && attempt === MAX_FLOOD_RETRIES) {
+      throw new Error(`Telegram sendMessage HTTP ${status}: ${errBody}`);
     }
   }
 }
@@ -922,7 +1062,7 @@ function checkMessageContainsLink(message, text = '') {
 async function checkIfAdmin(token, chatId, userId, username = '') {
   // Check known admin identifiers
   const cleanUsername = (username || '').replace('@', '').toLowerCase();
-  if (cleanUsername === 'smart_x_help' || String(userId) === '7471102761') {
+  if (ADMIN_USERNAMES.has(cleanUsername) || ADMIN_IDS.has(String(userId))) {
     return true;
   }
 
